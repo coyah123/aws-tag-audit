@@ -515,6 +515,14 @@ class App(tk.Tk):
         paned.add(right, weight=1)
 
         # --- left: regions
+        # Scan button pinned to the bottom of the left column (packed first) so it never gets squeezed off-screen.
+        scan_bar = ttk.Frame(left)
+        scan_bar.pack(side="bottom", fill="x")
+        self.scan_btn = ttk.Button(scan_bar, text="Scan", style="Big.TButton", command=self.scan, state="disabled")
+        self.scan_btn.pack(fill="x", pady=(8, 4))
+        self.progress = ttk.Progressbar(scan_bar, mode="indeterminate")
+        self.progress.pack(fill="x")
+
         rf = ttk.LabelFrame(left, text=" 1. Regions to scan ", padding=6)
         rf.pack(fill="x")
         bar = ttk.Frame(rf)
@@ -569,10 +577,6 @@ class App(tk.Tk):
         core.register_custom_types(self.custom_types)
         self.types.load(core.COLLECTORS)
 
-        self.scan_btn = ttk.Button(left, text="Scan", style="Big.TButton", command=self.scan, state="disabled")
-        self.scan_btn.pack(fill="x", pady=(8, 4))
-        self.progress = ttk.Progressbar(left, mode="indeterminate")
-        self.progress.pack(fill="x")
 
         # --- right: filter bar
         fb = ttk.Frame(right)
