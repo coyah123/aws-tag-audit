@@ -69,6 +69,7 @@ TAG_VALUE_RE = re.compile(r"^[\w\s.:/=+\-@]*$", re.UNICODE)
 class Ctx:
     def __init__(self, profile=None, region=None, workers=8):
         self.session = boto3.Session(profile_name=profile, region_name=region)
+        self.profile = profile
         self._lock = threading.Lock()
         self._clients = {}
         self.workers = workers
@@ -1250,20 +1251,142 @@ def is_retryable_tag_error(f):
     return any(c in blob for c in RETRYABLE_TAG_CODES) or "being updated" in blob
 
 
-def apply_tags(ctx, plan, key, dry_run, log=print):
-    """plan: list of (row, value). Returns list of result rows."""
-    results = []
+SAFE_ARG_RE = re.compile(r"^[A-Za-z0-9_./:@+=,\-]+$")
+
+
+def cli_quote(v):
+    """Quote an argument so the shown command pastes into bash, zsh, PowerShell or cmd."""
+    v = str(v)
+    return v if SAFE_ARG_RE.match(v) else '"%s"' % v.replace('"', '\\"')
+
+
+def _home_region_of(row, fallback):
+    parts = row.get("arn", "").split(":")
+    return HOME_REGION.get(parts[1], fallback) if len(parts) > 1 and parts[1] else fallback
+
+
+def group_plan(plan, home_region):
+    """Split (row, value) pairs the way apply_tags sends them.
+    Returns (no_arn, native_first, {(region, value): [rows]})."""
     by_region_value = defaultdict(list)
-    native_first = []
-    no_arn = []
+    native_first, no_arn = [], []
     for row, val in plan:
         if not row["arn"].startswith("arn:"):
             no_arn.append((row, val))
         elif row["service"] in ("iam", "route53"):
             native_first.append((row, val))
         else:
-            region = ctx.home_region if row["region"] in ("", "global") else row["region"]
+            region = _home_region_of(row, home_region) if row["region"] in ("", "global") else row["region"]
             by_region_value[(region, val)].append(row)
+    return no_arn, native_first, by_region_value
+
+
+def native_cli(row, key, val, home_region, profile=None):
+    """The aws CLI command equivalent to native_tag() for this row (None if there's no native tagger)."""
+    svc, rtype, region, rid, arn = row["service"], row["type"], row["region"], row["id"], row["arn"]
+    if region in ("", "global"):
+        region = _home_region_of(row, home_region)
+    kv_list = "Key=%s,Value=%s" % (key, val)
+    kv_map = "%s=%s" % (key, val)
+    if svc == "ec2":
+        cmd = ["ec2", "create-tags", "--region", region, "--resources", rid, "--tags", kv_list]
+    elif svc == "iam":
+        name = rid.rsplit("/", 1)[-1]
+        cmd = {"role": ["iam", "tag-role", "--role-name", name],
+               "user": ["iam", "tag-user", "--user-name", name],
+               "policy": ["iam", "tag-policy", "--policy-arn", arn],
+               "instance-profile": ["iam", "tag-instance-profile", "--instance-profile-name", name]}.get(rtype)
+        if cmd is None:
+            return None
+        cmd += ["--tags", kv_list]
+    elif svc == "route53" and rtype == "hostedzone":
+        cmd = ["route53", "change-tags-for-resource", "--resource-type", "hostedzone",
+               "--resource-id", rid.split("/")[-1], "--add-tags", kv_list]
+    elif svc == "s3":
+        cmd = ["s3api", "put-bucket-tagging", "--region", region, "--bucket", rid,
+               "--tagging", "TagSet=[<existing tags>,{%s}]" % kv_list]
+    elif svc == "logs":
+        cmd = ["logs", "tag-log-group", "--region", region, "--log-group-name", rid, "--tags", kv_map]
+    elif svc == "lambda":
+        cmd = ["lambda", "tag-resource", "--region", region, "--resource", arn, "--tags", kv_map]
+    elif svc == "eks":
+        cmd = ["eks", "tag-resource", "--region", region, "--resource-arn", arn, "--tags", kv_map]
+    elif svc == "sqs":
+        cmd = ["sqs", "tag-queue", "--region", region, "--queue-url", "<url of queue %s>" % rid, "--tags", kv_map]
+    else:
+        return None
+    if profile:
+        cmd += ["--profile", profile]
+    line = "aws " + " ".join(cli_quote(a) for a in cmd)
+    if svc == "s3":
+        line += "    # reads the bucket's current tags first and merges them, because put REPLACES all tags"
+    return line
+
+
+def plan_commands(plan, key, home_region, profile=None):
+    """The aws CLI commands apply_tags() will run for one key, in order (comment lines start with #).
+    plan: list of (row, value)."""
+    no_arn, native_first, by_region_value = group_plan(plan, home_region)
+    out = []
+    for (region, val), rows in sorted(by_region_value.items()):
+        for chunk in chunks(rows, 20):  # TagResources takes at most 20 ARNs per call
+            cmd = ["resourcegroupstaggingapi", "tag-resources", "--region", region,
+                   "--resource-arn-list"] + [r["arn"] for r in chunk] + ["--tags", "%s=%s" % (key, val)]
+            if profile:
+                cmd += ["--profile", profile]
+            out.append("aws " + " ".join(cli_quote(a) for a in cmd))
+    for row, val in native_first:
+        out.append(native_cli(row, key, val, home_region, profile) or
+                   "# %s:%s %s: no tag command for this type, it will fail" % (row["service"], row["type"], row["id"]))
+    for row, val in no_arn:
+        out.append("# %s:%s %s: skipped, no ARN (custom type needs an ARN field or ARN template)" % (
+            row["service"], row["type"], row["id"]))
+    return out
+
+
+def plan_lines(plans, home_region, profile=None, account=None, current_tags=None):
+    """Readable plan for {key: [(row, value), ...]}: the change on each resource, then the commands.
+    current_tags(row) -> dict overrides row["tags"] (CSV rows keep theirs in tags_json).
+    Returns (lines, number_of_commands)."""
+    def tags_of(row):
+        if current_tags:
+            return current_tags(row)
+        if isinstance(row.get("tags"), dict):
+            return row["tags"]
+        try:
+            return json.loads(row.get("tags_json") or "{}")
+        except ValueError:
+            return {}
+    by_res = defaultdict(list)
+    for key, p in plans.items():
+        for row, val in p:
+            by_res[row["arn"] or row["id"]].append((row, key, val))
+    total = sum(len(p) for p in plans.values())
+    lines = ["=" * 30 + " PLAN " + "=" * 30,
+             "%d tag changes on %d resources%s. Only these keys are added or overwritten; "
+             "every other tag stays as it is." % (total, len(by_res), (" in account %s" % account) if account else ""),
+             "", "Resources:"]
+    for _, items in sorted(by_res.items(), key=lambda kv: (kv[1][0][0]["service"], kv[1][0][0]["type"], kv[0])):
+        row = items[0][0]
+        tags = tags_of(row)
+        changes = ", ".join("%s: %s -> %s" % (k, tags[k] if k in tags else "(missing)", v) for _, k, v in items)
+        lines.append("  %-28s %-14s %-34s %s" % (row["service"] + ":" + row["type"], row["region"],
+                                                 (row["name"] or row["id"])[:34], changes))
+    lines += ["", "Commands (aws CLI equivalents of the API calls the tool will make, in order):"]
+    n = 0
+    for key, p in plans.items():
+        for c in plan_commands(p, key, home_region, profile):
+            n += 0 if c.startswith("#") else 1
+            lines.append("  " + c)
+    lines += ["", "If the Tagging API rejects a resource, the tool retries it with that service's own tag command "
+                  "and logs which one.", "=" * 28 + " END PLAN " + "=" * 28]
+    return lines, n
+
+
+def apply_tags(ctx, plan, key, dry_run, log=print):
+    """plan: list of (row, value). Returns list of result rows."""
+    results = []
+    no_arn, native_first, by_region_value = group_plan(plan, ctx.home_region)
 
     def record(row, val, status, msg=""):
         out = dict(row)
@@ -1277,6 +1400,9 @@ def apply_tags(ctx, plan, key, dry_run, log=print):
     def try_native(row, val, prior_msg=""):
         try:
             native_tag(ctx, row, key, val)
+            cmd = native_cli(row, key, val, ctx.home_region, getattr(ctx, "profile", None))
+            if cmd and prior_msg:
+                log("       Tagging API refused %s; using: %s" % (row["name"] or row["id"], cmd))
             record(row, val, "tagged", "native API")
         except Unsupported as e:
             record(row, val, "failed", (prior_msg + " | " if prior_msg else "") + str(e))
@@ -1471,11 +1597,8 @@ def cmd_apply(args):
         print("Nothing to do: no rows have a value in %s." % ", ".join("'%s'" % k for k in keys))
         return
 
-    total = sum(len(p) for p in plans.values())
-    print("\nPlan: %d tag changes on %d resources." % (total, len({r["arn"] for p in plans.values() for r, _ in p})))
-    for k, p in plans.items():
-        for v, n in Counter(v for _, v in p).most_common():
-            print("  %6d  %s=%s" % (n, k, v))
+    lines, _ = plan_lines(plans, args.region or "us-east-1", args.profile)
+    print("\n" + "\n".join(lines))
     if not args.dry_run and not args.yes:
         if input("\nApply these tags now? [y/N] ").strip().lower() not in ("y", "yes"):
             print("Aborted, nothing changed.")

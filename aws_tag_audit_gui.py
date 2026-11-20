@@ -39,6 +39,13 @@ MOD = "Command" if IS_MAC else "Control"  # select-all shortcut modifier
 
 MISSING = "✗ missing"
 EMPTY = "✗ (empty)"
+CHECKED, UNCHECKED, PARTIAL = "\u2611", "\u2610", "\u25a3"
+
+
+def tags_text(tags):
+    return "  ".join("%s=%s" % kv for kv in sorted(tags.items())) if tags else "(no tags)"
+
+
 ARROW = "→ "
 
 
@@ -498,8 +505,10 @@ class App(tk.Tk):
         self.acct_lbl = ttk.Label(top, text="Not connected", foreground="#a00")
         self.acct_lbl.pack(side="left", padx=12)
 
-        paned = ttk.PanedWindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=8, pady=4)
+        vpaned = ttk.PanedWindow(self, orient="vertical")
+        vpaned.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        paned = ttk.PanedWindow(vpaned, orient="horizontal")
+        vpaned.add(paned, weight=1)
         left = ttk.Frame(paned, width=330)
         right = ttk.Frame(paned)
         paned.add(left, weight=0)
@@ -586,7 +595,10 @@ class App(tk.Tk):
         # --- right: table
         tf = ttk.Frame(right)
         tf.pack(fill="both", expand=True, pady=4)
-        self.tree = ttk.Treeview(tf, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(tf, show="tree headings", selectmode="extended")
+        self.tree.heading("#0", text=UNCHECKED, command=self.toggle_all_checked)
+        self.tree.column("#0", width=40, minwidth=40, stretch=False, anchor="center")
+        self.checked = set()  # indexes into self.resources
         ys = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
         xs = ttk.Scrollbar(tf, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -600,9 +612,15 @@ class App(tk.Tk):
         self.tree.tag_configure("pending", background="#fff6cc", foreground="#111")
         self.tree.tag_configure("ok", background="#e9f7ec", foreground="#111")
         self.tree.bind("<Double-1>", self.on_double)
+        self.tree.bind("<Button-1>", self.on_click, add="+")
+        self.tree.bind("<space>", lambda e: (self.toggle_checked(self.tree.selection()), "break")[1])
         self.tree.bind("<%s-a>" % MOD, lambda e: (self.tree.selection_set(self.tree.get_children()), "break")[1])
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_counts())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: (self._update_counts(), self._show_tags()))
         self._set_columns()
+        self.tags_lbl = ttk.Label(right, text="Select a row to see all of its current tags.", foreground="#444",
+                                  justify="left", wraplength=900, font=MONO)
+        self.tags_lbl.pack(fill="x", anchor="w")
+        right.bind("<Configure>", lambda e: self.tags_lbl.configure(wraplength=max(300, e.width - 20)))
 
         # --- right: edit bar
         eb = ttk.LabelFrame(right, text=" 4. Set tag values ", padding=6)
@@ -616,12 +634,14 @@ class App(tk.Tk):
         self.edit_val.bind("<Return>", lambda e: self.set_value(selected=True))
         self.only_missing = tk.BooleanVar(value=True)
         ttk.Checkbutton(eb, text="only where missing", variable=self.only_missing).pack(side="left", padx=4)
-        ttk.Button(eb, text="Set on selected", command=lambda: self.set_value(selected=True)).pack(side="left", padx=2)
+        ttk.Button(eb, text="Set on ticked", command=lambda: self.set_value(selected=True)).pack(side="left", padx=2)
         ttk.Button(eb, text="Set on all shown", command=lambda: self.set_value(selected=False)).pack(side="left", padx=2)
-        ttk.Button(eb, text="Clear pending (selected)", command=self.clear_pending).pack(side="left", padx=2)
-        ttk.Label(right, text="Tip: double-click a tag cell to edit one resource. Ctrl+A selects all shown rows. "
-                              "Yellow = pending change, red = non-compliant, green = compliant.",
-                  foreground="#666").pack(anchor="w", pady=(2, 0))
+        ttk.Button(eb, text="Clear pending (ticked)", command=self.clear_pending).pack(side="left", padx=2)
+        ttk.Label(right, text="Tip: tick the box on each row you want (click the header box to tick every shown row, "
+                              "Space ticks the highlighted rows). With nothing ticked, the highlighted rows are used. "
+                              "Double-click a tag cell to edit one resource. "
+                              "Yellow = pending, red = non-compliant, green = compliant.",
+                  foreground="#666", wraplength=900, justify="left").pack(anchor="w", pady=(2, 0))
 
         # --- right: action bar
         ab = ttk.Frame(right)
@@ -630,14 +650,17 @@ class App(tk.Tk):
         self.apply_btn = ttk.Button(ab, text="Apply 0 pending changes", style="Big.TButton", command=self.apply, state="disabled")
         self.apply_btn.pack(side="left")
         ttk.Checkbutton(ab, text="Dry run", variable=self.dry_run).pack(side="left", padx=8)
+        ttk.Button(ab, text="Show plan in log", command=self.show_plan).pack(side="left")
         ttk.Button(ab, text="Export CSV...", command=self.export).pack(side="right")
 
         # --- log
-        lf = ttk.LabelFrame(self, text=" Log ", padding=4)
-        lf.pack(fill="x", padx=8, pady=(0, 8))
-        self.log_txt = tk.Text(lf, height=9, wrap="none", font=MONO, state="disabled")
+        lf = ttk.LabelFrame(vpaned, text=" Log (drag the divider above to make it bigger) ", padding=4)
+        vpaned.add(lf, weight=0)
+        self.log_txt = tk.Text(lf, height=12, wrap="none", font=MONO, state="disabled")
         lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log_txt.yview)
-        self.log_txt.configure(yscrollcommand=lsb.set)
+        lxs = ttk.Scrollbar(lf, orient="horizontal", command=self.log_txt.xview)
+        self.log_txt.configure(yscrollcommand=lsb.set, xscrollcommand=lxs.set)
+        lxs.pack(side="bottom", fill="x")
         self.log_txt.pack(side="left", fill="both", expand=True)
         lsb.pack(side="right", fill="y")
         self._refresh_key_combo()
@@ -844,7 +867,7 @@ class App(tk.Tk):
             self.scan_btn.configure(state="normal")
             self.log("Connected to %s as %s; %d enabled regions." % (self.ctx.account, self.ctx.caller_arn, len(regions)))
             if self.resources:
-                self.resources, self.pending = [], {}
+                self.resources, self.pending, self.checked = [], {}, set()
                 self.refresh()
             if on_result:
                 on_result(True, "account %s as %s" % (self.ctx.account, self.ctx.caller_arn))
@@ -884,6 +907,7 @@ class App(tk.Tk):
         def done(resources):
             self.resources = resources
             self.pending = {}
+            self.checked = set()
             self.refresh()
             bad = sum(1 for r in resources if self._noncompliant(r) and not r.get("k8s"))
             self.log("Scan complete: %d resources, %d non-compliant for %s." % (len(resources), bad, ", ".join(self.keys())))
@@ -952,13 +976,15 @@ class App(tk.Tk):
 
     # -------------------------------------------------------------- table
     def _set_columns(self):
-        cols = ["type", "region", "name", "id", "eks"] + ["k:" + k for k in self.keys()]
+        cols = ["type", "region", "name", "id", "eks"] + ["k:" + k for k in self.keys()] + ["tags"]
         self.tree.configure(columns=cols)
-        widths = {"type": 190, "region": 105, "name": 220, "id": 200, "eks": 110}
+        widths = {"type": 160, "region": 95, "name": 170, "id": 170, "eks": 95, "tags": 420}
         for c in cols:
-            label = c[2:] if c.startswith("k:") else ("EKS cluster" if c == "eks" else c.capitalize())
+            label = c[2:] if c.startswith("k:") else {"eks": "EKS cluster", "tags": "Current tags"}.get(c, c.capitalize())
             self.tree.heading(c, text=label, command=lambda c=c: self._sort_by(c))
-            self.tree.column(c, width=widths.get(c, 150), stretch=c.startswith("k:") or c == "name", anchor="w")
+            mins = {"type": 120, "region": 90, "name": 140, "id": 140, "eks": 80, "tags": 200}
+            self.tree.column(c, width=widths.get(c, 150), minwidth=mins.get(c, 110),
+                             stretch=c in ("tags", "name"), anchor="w")
 
     def _sort_by(self, col):
         self.sort = (col, not self.sort[1] if self.sort[0] == col else False)
@@ -1049,7 +1075,8 @@ class App(tk.Tk):
             has_pending = any((i, k) in self.pending for k in keys)
             if self.only_bad.get() and not bad and not has_pending:
                 continue
-            vals = ["%s:%s" % (r["service"], r["type"]), r["region"], r["name"], r["id"], r.get("eks_cluster", "")] + [self._cell(i, k) for k in keys]
+            vals = ["%s:%s" % (r["service"], r["type"]), r["region"], r["name"], r["id"], r.get("eks_cluster", "")] + \
+                   [self._cell(i, k) for k in keys] + [tags_text(r["tags"])]
             if needle and not any(needle in str(v).lower() for v in vals + [r["arn"]]):
                 continue
             tag = "pending" if has_pending else ("bad" if bad else "ok")
@@ -1059,8 +1086,10 @@ class App(tk.Tk):
             ci = list(self.tree["columns"]).index(col) if col in self.tree["columns"] else 0
             rows.sort(key=lambda x: str(x[1][ci]).lower(), reverse=rev)
         for i, vals, tag in rows:
-            self.tree.insert("", "end", iid=str(i), values=vals, tags=(tag,))
+            self.tree.insert("", "end", iid=str(i), text=CHECKED if i in self.checked else UNCHECKED,
+                             values=vals, tags=(tag,))
         self._shown = len(rows)
+        self._sync_header_box()
         off = [t for t in present if not self.type_filter.get(t, True)]
         self.types_btn.configure(text=("Types: %d of %d ▾" % (len(present) - len(off), len(present))) if off else "Types: all ▾")
         self._update_counts()
@@ -1074,12 +1103,62 @@ class App(tk.Tk):
         bad = sum(1 for r in scope if self._noncompliant(r))
         p = self._pending_items()
         k8s = getattr(self, "_k8s_hidden", 0)
-        self.count_lbl.configure(text="%d shown  |  %d selected  |  %d of %d non-compliant  |  %d pending%s" % (
-            getattr(self, "_shown", 0), len(self.tree.selection()), bad, len(scope), len(p),
+        self.count_lbl.configure(text="%d shown  |  %d ticked  |  %d of %d non-compliant  |  %d pending%s" % (
+            getattr(self, "_shown", 0), len(self._ticked_shown()), bad, len(scope), len(p),
             ("  |  %d pod resources hidden" % k8s) if k8s else ""))
         n_res = len({i for i, _ in p})
         self.apply_btn.configure(text="Apply %d pending changes (%d resources)" % (len(p), n_res),
                                  state="normal" if p and not self.busy else "disabled")
+
+    # ------------------------------------------------------------- ticks
+    def _ticked_shown(self):
+        return [iid for iid in self.tree.get_children() if int(iid) in self.checked]
+
+    def _sync_header_box(self):
+        shown = self.tree.get_children()
+        n = len(self._ticked_shown())
+        self.tree.heading("#0", text=CHECKED if shown and n == len(shown) else (PARTIAL if n else UNCHECKED))
+
+    def toggle_checked(self, iids, value=None):
+        iids = list(iids)
+        if not iids:
+            return
+        if value is None:  # one click: tick all if any are unticked, otherwise untick
+            value = any(int(i) not in self.checked for i in iids)
+        for iid in iids:
+            (self.checked.add if value else self.checked.discard)(int(iid))
+            if self.tree.exists(iid):
+                self.tree.item(iid, text=CHECKED if value else UNCHECKED)
+        self._sync_header_box()
+        self._update_counts()
+
+    def toggle_all_checked(self):
+        self.toggle_checked(self.tree.get_children())
+
+    def uncheck_all(self):
+        self.checked.clear()
+        self.refresh()
+
+    def on_click(self, event):
+        if self.tree.identify_region(event.x, event.y) == "tree":
+            iid = self.tree.identify_row(event.y)
+            if iid:
+                self.toggle_checked([iid])
+                return "break"   # don't change the highlight when clicking the box
+
+    def _targets(self):
+        """Rows the 'ticked' buttons act on: ticked rows that are shown, else the highlighted rows."""
+        return self._ticked_shown() or list(self.tree.selection())
+
+    def _show_tags(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        r = self.resources[int(sel[0])]
+        more = "   (+%d more highlighted)" % (len(sel) - 1) if len(sel) > 1 else ""
+        self.tags_lbl.configure(text="%s  %s  current tags (%d): %s%s" % (
+            self._tkey(r), r["name"] or r["id"], len(r["tags"]),
+            "  ".join("%s=%s" % kv for kv in sorted(r["tags"].items())) or "(none)", more))
 
     # -------------------------------------------------------------- edits
     def _check_value(self, v):
@@ -1095,9 +1174,10 @@ class App(tk.Tk):
             return
         if not val or not self._check_value(val):
             return
-        targets = self.tree.selection() if selected else self.tree.get_children()
+        targets = self._targets() if selected else self.tree.get_children()
         if not targets:
-            messagebox.showinfo("Nothing selected", "Select rows in the table first (Ctrl+A for all shown).")
+            messagebox.showinfo("Nothing ticked", "Tick the rows you want first (the box at the left of each row, "
+                                "or the header box for every shown row).")
             return
         n = 0
         for iid in targets:
@@ -1106,14 +1186,14 @@ class App(tk.Tk):
                 continue
             self.pending[(i, key)] = val
             n += 1
-        self.log("Pending: %s=%s on %d resources%s." % (key, val, n, " (skipped ones that already have it)" if n < len(targets) else ""))
+        self.log("Pending: %s=%s on %d resources%s." % (key, val, n, " (skipped %d that already have it)" % (len(targets) - n) if n < len(targets) else ""))
         sel = self.tree.selection()
         self.refresh()
         self.tree.selection_set([s for s in sel if self.tree.exists(s)])
 
     def clear_pending(self):
         sel = self.tree.selection()
-        for iid in sel:
+        for iid in self._targets():
             for k in self.keys():
                 self.pending.pop((int(iid), k), None)
         self.refresh()
@@ -1147,20 +1227,39 @@ class App(tk.Tk):
             self.tree.see(iid)
 
     # -------------------------------------------------------------- apply
+    def _plan(self):
+        by_key = defaultdict(list)
+        for (i, k), v in sorted(self._pending_items().items()):
+            by_key[k].append((self.resources[i], v))
+        return dict(by_key)
+
+    def show_plan(self):
+        if not self._pending_items():
+            messagebox.showinfo("No plan", "Nothing is pending. Tick rows and use 'Set on ticked' first.")
+            return None
+        lines, n_cmds = core.plan_lines(self._plan(), self.ctx.home_region if self.ctx else "us-east-1",
+                                        getattr(self.ctx, "profile", None), self.ctx.account if self.ctx else None)
+        for line in lines:
+            self.log(line)
+        return n_cmds
+
     def apply(self):
         p = self._pending_items()
         if not p:
             return
-        by_key = defaultdict(list)
-        for (i, k), v in p.items():
-            by_key[k].append((self.resources[i], v))
-        summary = "\n".join("  %s = %s  x%d" % (k, v, n) for (k, v), n in Counter((k, v) for (_, k), v in p.items()).most_common(15))
+        by_key = self._plan()
         dry = self.dry_run.get()
+        n_cmds = self.show_plan()
+        summary = "\n".join("  %s = %s  x%d" % (k, v, n) for (k, v), n in Counter((k, v) for (_, k), v in p.items()).most_common(15))
         if not messagebox.askyesno("Confirm" + (" (DRY RUN)" if dry else ""),
-                                   "%s %d tag changes on %d resources in account %s?\n\n%s\n\nOnly these keys are added/overwritten; other tags are untouched." % (
-                                       "Simulate" if dry else "Apply", len(p), len({i for i, _ in p}), self.ctx.account, summary)):
+                                   "%s %d tag changes on %d resources in account %s?\n\n%s\n\n"
+                                   "The full plan (every resource and the %d AWS commands) is in the log.\n"
+                                   "Only these keys are added/overwritten; other tags are untouched." % (
+                                       "Simulate" if dry else "Apply", len(p), len({i for i, _ in p}), self.ctx.account,
+                                       summary, n_cmds)):
+            self.log("Cancelled; nothing was changed.")
             return
-        self.log("%s %d tag changes..." % ("DRY RUN:" if dry else "Applying", len(p)))
+        self.log("%s %d tag changes..." % ("DRY RUN (nothing is changed):" if dry else "Applying", len(p)))
 
         def work():
             out = []

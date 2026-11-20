@@ -83,16 +83,19 @@ Keep `aws_tag_audit.py` in the same folder, because the GUI uses its scan and ta
    - The "Tagging API catch-all" option (**off by default**, because it is very granular) also picks up every *already-tagged* resource of any other type. After a scan, the log lists the types that only the Tagging API found.
 5. **Scan.** The table shows one column per required key:
    - the existing value, or `✗ missing`, `✗ (empty)` or `✗ program=x` (wrong case)
+   - a **Current tags** column with every tag the resource has now (scroll right). The line under the table shows the full tag list of the highlighted row.
    - red rows are non-compliant, green rows are compliant, yellow rows have a pending change
    - The filter box and the "Only show non-compliant" toggle narrow the list, and you can click a column header to sort.
    - **Types ▾** opens a checklist of every resource type in the results, with "non-compliant / total" counts. Untick types to hide them from the list, and the button shows "Types: 4 of 12". **Only types with gaps** ticks just the types that still need tags.
    - **Hide pod resources** is on by default (PVC volumes, per-pod interfaces, load balancers for Kubernetes Services). Nodes and their volumes and interfaces are always shown, with an **EKS cluster** column. See [EKS and Kubernetes](#eks-and-kubernetes).
    - "Set on all shown" and Export only affect the rows currently shown, so filter first and then tag.
-6. **Set values.** Choose a key and type a value. Then:
-   - **Set on selected** (Ctrl+A, or ⌘A on a Mac, selects all shown rows), or **Set on all shown**. Use the filter first, for example `ec2:volume` or `us-gov-west-1`.
+6. **Set values.** Tick the resources you want with the checkbox at the left of each row. Clicking the header checkbox ticks (or unticks) every shown row, and Space ticks the highlighted rows. Choose a key and type a value. Then:
+   - **Set on ticked** sets it on the ticked rows that are shown. If nothing is ticked, it uses the highlighted rows instead.
+   - **Set on all shown** sets it on every row in the list. Use the filter first, for example `ec2:volume` or `us-gov-west-1`.
+   - **Clear pending (ticked)** removes pending values from the ticked rows.
    - **Double-click a tag cell** to edit a single resource.
    - With "only where missing" ticked, resources that already have a value for that key are left alone.
-7. **Apply.** The confirmation dialog lists what will change. Tick **Dry run** to simulate without changing anything. Failed changes stay pending, with the error shown in the log. Each apply writes a `tag-apply-results_<acct>_<time>.csv` file to the current folder.
+7. **Apply.** First the full plan is written to the log: each resource with its change (`Program: (missing) -> ALPHA`), then the exact AWS CLI commands equivalent to the API calls the tool will make, for example `aws resourcegroupstaggingapi tag-resources --region us-east-1 --resource-arn-list arn:… --tags Program=ALPHA` and `aws iam tag-role --role-name app-role --tags Key=Program,Value=ALPHA`. Then a confirmation dialog asks before anything changes. **Show plan in log** prints the plan without applying. If the Tagging API rejects a resource during apply, the log shows the service-specific command used instead. Tick **Dry run** to simulate without changing anything. Failed changes stay pending, with the error shown in the log. Each apply writes a `tag-apply-results_<acct>_<time>.csv` file to the current folder.
 8. **Export CSV.** Saves the rows currently shown, with value, status and pending value for each key.
 
 ## Custom resource types
@@ -257,7 +260,7 @@ python aws_tag_audit.py apply --csv ..._untagged.csv --value ALPHA --services ec
 python aws_tag_audit.py apply --csv ..._untagged.csv --value Program=ALPHA --value Owner=platform --services eks
 ```
 
-Before anything changes, `apply` always shows a summary (for example "set Program on N resources: 40×ALPHA, 12×BRAVO") and asks y/N. Use `--yes` to skip that question.
+Before anything changes, `apply` always prints the plan: each resource with its change (`Program: (missing) -> ALPHA`) and the AWS CLI commands equivalent to the API calls it will make. Then it asks y/N. Use `--yes` to skip that question; `--dry-run` prints the plan and changes nothing.
 
 It also **refuses to run if the CSV is from a different account** than the one you're logged into.
 
