@@ -575,7 +575,7 @@ class App(tk.Tk):
         self.only_bad = tk.BooleanVar(value=True)
         ttk.Checkbutton(fb, text="Only show non-compliant", variable=self.only_bad, command=self.refresh).pack(side="left", padx=8)
         self.hide_k8s = tk.BooleanVar(value=True)
-        ttk.Checkbutton(fb, text="Hide EKS-managed (nodes, pods' volumes/ENIs/LBs)", variable=self.hide_k8s,
+        ttk.Checkbutton(fb, text="Hide pod resources (PVCs, pod ENIs, Service LBs)", variable=self.hide_k8s,
                         command=self.refresh).pack(side="left", padx=(0, 8))
         self.type_filter = {}  # "service:type" -> shown?
         self.types_btn = ttk.Button(fb, text="Types: all ▾", command=self.open_type_filter)
@@ -889,7 +889,7 @@ class App(tk.Tk):
             self.log("Scan complete: %d resources, %d non-compliant for %s." % (len(resources), bad, ", ".join(self.keys())))
             k8s = Counter(r["k8s"] for r in resources if r.get("k8s"))
             if k8s:
-                self.log("Hidden as EKS/Kubernetes-managed (untick 'Hide EKS-managed' to see them): " +
+                self.log("Hidden as Kubernetes pod resources (untick 'Hide pod resources' to see them): " +
                          ", ".join("%s x%d" % kv for kv in k8s.most_common()))
             # Suggest keys people choose; skip ones AWS/Kubernetes controllers stamp automatically.
             system = ("aws:", "eks:", "karpenter.", "kubernetes.io", "k8s.", "CSIVolume")
@@ -952,11 +952,11 @@ class App(tk.Tk):
 
     # -------------------------------------------------------------- table
     def _set_columns(self):
-        cols = ["type", "region", "name", "id"] + ["k:" + k for k in self.keys()]
+        cols = ["type", "region", "name", "id", "eks"] + ["k:" + k for k in self.keys()]
         self.tree.configure(columns=cols)
-        widths = {"type": 190, "region": 105, "name": 220, "id": 220}
+        widths = {"type": 190, "region": 105, "name": 220, "id": 200, "eks": 110}
         for c in cols:
-            label = c[2:] if c.startswith("k:") else c.capitalize()
+            label = c[2:] if c.startswith("k:") else ("EKS cluster" if c == "eks" else c.capitalize())
             self.tree.heading(c, text=label, command=lambda c=c: self._sort_by(c))
             self.tree.column(c, width=widths.get(c, 150), stretch=c.startswith("k:") or c == "name", anchor="w")
 
@@ -1049,7 +1049,7 @@ class App(tk.Tk):
             has_pending = any((i, k) in self.pending for k in keys)
             if self.only_bad.get() and not bad and not has_pending:
                 continue
-            vals = ["%s:%s" % (r["service"], r["type"]), r["region"], r["name"], r["id"]] + [self._cell(i, k) for k in keys]
+            vals = ["%s:%s" % (r["service"], r["type"]), r["region"], r["name"], r["id"], r.get("eks_cluster", "")] + [self._cell(i, k) for k in keys]
             if needle and not any(needle in str(v).lower() for v in vals + [r["arn"]]):
                 continue
             tag = "pending" if has_pending else ("bad" if bad else "ok")
@@ -1076,7 +1076,7 @@ class App(tk.Tk):
         k8s = getattr(self, "_k8s_hidden", 0)
         self.count_lbl.configure(text="%d shown  |  %d selected  |  %d of %d non-compliant  |  %d pending%s" % (
             getattr(self, "_shown", 0), len(self.tree.selection()), bad, len(scope), len(p),
-            ("  |  %d EKS-managed hidden" % k8s) if k8s else ""))
+            ("  |  %d pod resources hidden" % k8s) if k8s else ""))
         n_res = len({i for i, _ in p})
         self.apply_btn.configure(text="Apply %d pending changes (%d resources)" % (len(p), n_res),
                                  state="normal" if p and not self.busy else "disabled")
@@ -1211,13 +1211,13 @@ class App(tk.Tk):
                 continue
             row = {"compliant": "no" if self._noncompliant(r) else "yes", "service": r["service"], "type": r["type"],
                    "region": r["region"], "name": r["name"], "id": r["id"], "arn": r["arn"], "source": r["source"],
-                   "k8s_workload": r.get("k8s", ""), "tags_json": core.json.dumps(r["tags"], sort_keys=True)}
+                   "eks_cluster": r.get("eks_cluster", ""), "k8s_workload": r.get("k8s", ""), "tags_json": core.json.dumps(r["tags"], sort_keys=True)}
             for k in keys:
                 row[k] = r["tags"].get(k, "")
                 row[k + "_status"] = core.evaluate(r["tags"], k) or "ok"
                 row[k + "_pending"] = self.pending.get((i, k), "")
             rows.append(row)
-        fields = ["compliant", "service", "type", "region", "name", "id"] + \
+        fields = ["compliant", "service", "type", "region", "name", "id", "eks_cluster"] + \
                  [f for k in keys for f in (k, k + "_status", k + "_pending")] + ["arn", "source", "k8s_workload", "tags_json"]
         core.write_csv(path, rows, fields)
         self.log("Exported %d rows (what's currently shown) to %s" % (len(rows), path))

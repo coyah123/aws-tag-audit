@@ -75,8 +75,8 @@ Keep `aws_tag_audit.py` in the same folder, because the GUI uses its scan and ta
    - Keys stamped automatically by AWS or Kubernetes (`aws:`, `eks:`, `kubernetes.io/…`) are not suggested.
    - You can add or remove keys **after** a scan and the table updates instantly, because the scan keeps every resource's full tag set.
 4. **Resource types.** A checklist of every resource type, grouped by service.
-   - **By default only main resource types are ticked:** instances, volumes, VPCs, NAT gateways, buckets, databases, Lambda, load balancers, EKS clusters, ECS/ECR, queues, topics, secrets, KMS keys and so on.
-   - **Fine-grained types** are marked `· fine-grained` and start unticked: AMIs, snapshots, subnets, ENIs, route tables, NACLs, security groups, target groups, log groups, IAM, CloudFormation, EKS nodegroups/add-ons/Fargate profiles. Tick them when you need them.
+   - **By default only main resource types are ticked:** instances, volumes, network interfaces, security groups, launch templates, VPCs, NAT gateways, buckets, databases, Lambda, load balancers, EKS clusters and nodegroups, ECS/ECR, queues, topics, secrets, KMS keys and so on.
+   - **Fine-grained types** are marked `· fine-grained` and start unticked: AMIs, snapshots, subnets, route tables, NACLs, internet gateways, target groups, log groups, IAM, CloudFormation, EKS add-ons/Fargate profiles. Tick them when you need them.
    - **Main only** resets to the default.
    - Click a service to toggle all of its types, or expand it to pick individual types (for example only `ec2 › volume`).
    - Your own custom types appear under **★ custom**. See [Custom resource types](#custom-resource-types) below.
@@ -86,7 +86,7 @@ Keep `aws_tag_audit.py` in the same folder, because the GUI uses its scan and ta
    - red rows are non-compliant, green rows are compliant, yellow rows have a pending change
    - The filter box and the "Only show non-compliant" toggle narrow the list, and you can click a column header to sort.
    - **Types ▾** opens a checklist of every resource type in the results, with "non-compliant / total" counts. Untick types to hide them from the list, and the button shows "Types: 4 of 12". **Only types with gaps** ticks just the types that still need tags.
-   - **Hide EKS-managed** is on by default. See [EKS and Kubernetes](#eks-and-kubernetes).
+   - **Hide pod resources** is on by default (PVC volumes, per-pod interfaces, load balancers for Kubernetes Services). Nodes and their volumes and interfaces are always shown, with an **EKS cluster** column. See [EKS and Kubernetes](#eks-and-kubernetes).
    - "Set on all shown" and Export only affect the rows currently shown, so filter first and then tag.
 6. **Set values.** Choose a key and type a value. Then:
    - **Set on selected** (Ctrl+A, or ⌘A on a Mac, selects all shown rows), or **Set on all shown**. Use the filter first, for example `ec2:volume` or `us-gov-west-1`.
@@ -182,7 +182,7 @@ python aws_tag_audit.py scan --all-types                       # include fine-gr
 python aws_tag_audit.py scan --services ec2:snapshot           # just one (any) type
 ```
 
-**By default `scan` covers main resource types only**, the same set the GUI ticks by default: instances, volumes, VPCs, buckets, databases, Lambda, load balancers, EKS clusters and so on. `--all-types` adds the fine-grained ones (AMIs, snapshots, subnets, ENIs, route tables, security groups, target groups, log groups, IAM, EKS nodegroups/add-ons). `types` lists which is which, with fine-grained types marked `*`.
+**By default `scan` covers main resource types only**, the same set the GUI ticks by default: instances, volumes, network interfaces, security groups, VPCs, buckets, databases, Lambda, load balancers, EKS clusters and nodegroups and so on. `--all-types` adds the fine-grained ones (AMIs, snapshots, subnets, route tables, target groups, log groups, IAM, EKS add-ons). `types` lists which is which, with fine-grained types marked `*`.
 
 `--key` defaults to `Program`. With several keys, a resource is listed if it is missing **any** of them, and the summary shows a count for each key per resource type.
 
@@ -277,28 +277,37 @@ Run `scan` again. Anything you tagged will be gone from the untagged list.
 
 ## EKS and Kubernetes
 
-For EKS, the tool lists **only the cluster** by default (`eks:cluster`). Tag the cluster; there's no need to tag everything inside it.
+The tool covers an EKS cluster's **AWS infrastructure**, and skips the things that exist only because of what runs **inside** the cluster.
 
-- **Fine-grained, off by default:** `eks:nodegroup`, `eks:fargateprofile` and `eks:addon`. Tick them, or use `--all-types`, if you also want to tag those.
-- **Hidden as EKS-managed:** anything EKS or Kubernetes creates *for* a cluster. It's owned by the cluster, comes and goes with it, and picks up tags from the cluster, nodegroup and launch template. These resources are recognised by the ownership tags EKS, eksctl, Karpenter and the Kubernetes controllers stamp on them:
+**Listed** (main types, ticked by default). Each one gets an **EKS cluster** column, so you can see what belongs to which cluster, and typing the cluster name in the filter box shows just that cluster.
+
+| Resource | Type |
+|---|---|
+| The cluster | `eks:cluster` |
+| Managed nodegroups | `eks:nodegroup` |
+| Nodes | `ec2:instance` |
+| Node volumes (root/data) | `ec2:volume` |
+| Node network interfaces, including the VPC CNI's per-node `aws-K8S-…` interfaces | `ec2:network-interface` |
+| Nodegroup launch templates, Auto Scaling groups, cluster security group | `ec2:launch-template`, `autoscaling`, `ec2:security-group` |
+
+Fargate profiles and add-ons are available, but they're fine-grained and unticked by default.
+
+**Hidden: pod and in-cluster resources.** These are recognised by the tags and descriptions Kubernetes controllers put on them:
 
 | Hidden | How it's recognised |
 |---|---|
-| Nodes, node volumes and node ENIs, nodegroup launch templates, nodegroup Auto Scaling groups, the cluster security group, VPCs/subnets eksctl created | `eks:cluster-name`, `eks:nodegroup-name`, `aws:eks:cluster-name`, `alpha.eksctl.io/cluster-name`, `kubernetes.io/cluster/<name>=owned`, `karpenter.sh/…` tags |
-| PersistentVolume EBS/EFS/FSx volumes | `kubernetes.io/created-for/…`, `CSIVolumeName`, `ebs.csi.aws.com/…` tags |
-| Pod network interfaces (VPC CNI, security groups for pods) | `aws-K8S-…` / `aws-k8s-branch-eni` description, `node.k8s.amazonaws.com/…` tags |
-| Load balancers, target groups and security groups made for Services/Ingresses | `elbv2.k8s.aws/…`, `ingress.k8s.aws/…`, `service.k8s.aws/…`, `kubernetes.io/service-name` tags |
+| PersistentVolume EBS/EFS/FSx volumes (PVCs) | `kubernetes.io/created-for/…`, `CSIVolumeName`, `ebs.csi.aws.com/…` tags |
+| Per-pod network interfaces (security groups for pods) | `branch` interface type, `aws-k8s-branch-eni` description, `vpcresources.k8s.aws/…` tags |
+| Load balancers, target groups and security groups created for Kubernetes Services/Ingresses | `elbv2.k8s.aws/…`, `ingress.k8s.aws/…`, `service.k8s.aws/…`, `kubernetes.io/service-name` tags |
 | EKS pod identity associations | resource type |
 
-Some things are **not** hidden:
-- the EKS cluster itself
-- subnets in a shared VPC (`kubernetes.io/cluster/<name>=shared`)
-- subnets and security groups you tagged `karpenter.sh/discovery` so Karpenter can find them
-- ordinary instances in non-EKS Auto Scaling groups
+**Images are not scanned by default:** AMIs (`ec2:image`) and snapshots are fine-grained types. Tick them, or use `--all-types`, if you ever need them.
 
-To see the hidden resources:
-- **GUI:** untick **Hide EKS-managed**. The counts line shows how many are hidden, and the log lists them by kind and cluster.
-- **CLI:** they're left out of `*_untagged.csv`, and the summary says how many. `--include-eks-managed` lists them. The inventory CSV always includes them, with a `k8s_workload` column that gives the reason.
+**Network interfaces that AWS services create for themselves are left out completely.** These are "requester-managed" interfaces for load balancers, NAT gateways, Lambda, RDS, VPC endpoints and so on. They belong to those services, not to you or your nodes.
+
+To see the hidden pod resources:
+- **GUI:** untick **Hide pod resources**. The counts line shows how many are hidden, and the log lists them by kind.
+- **CLI:** they're left out of `*_untagged.csv`, and the summary says how many. `--include-k8s-workloads` lists them. The inventory CSV always includes them, with a `k8s_workload` column that gives the reason, and every CSV has an `eks_cluster` column.
 
 Tagging EKS resources uses the Tagging API first, then the EKS `TagResource` API as a fallback.
 
@@ -343,7 +352,7 @@ Services that aren't available in a region are silently skipped (`ServiceNotInRe
 ```
 common:  --profile  --region  --key K1 [K2 ...]  --regions r1 r2  --services ec2 s3 ec2:volume eks  --workers 8  --types-file F
 types:   --test NAME
-scan:    --all-types   --tagging-api   --include-eks-managed   --exclude-services logs ec2:volume   --out DIR
+scan:    --all-types   --tagging-api   --include-k8s-workloads   --exclude-services logs ec2:volume   --out DIR
 apply:   --csv FILE  -i/--interactive  --value [KEY=]V (repeatable)  --overwrite-csv-values  --dry-run  -y/--yes
 ```
 
