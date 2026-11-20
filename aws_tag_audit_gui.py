@@ -697,6 +697,7 @@ class App(tk.Tk):
         ttk.Button(ebw, text="Set on ticked", command=lambda: self.set_value(selected=True)).pack(side="left", padx=2)
         ttk.Button(ebw, text="Set on all shown", command=lambda: self.set_value(selected=False)).pack(side="left", padx=2)
         ttk.Button(ebw, text="Clear pending (ticked)", command=self.clear_pending).pack(side="left", padx=2)
+        ttk.Button(ebw, text="Untick all", command=self.uncheck_all).pack(side="left", padx=2)
         ttk.Label(ebw, text="Tick a whole EKS cluster:").pack(side="left", padx=(14, 2))
         self.cluster_pick = ttk.Combobox(ebw, width=20, state="readonly", values=[])
         self.cluster_pick.pack(side="left")

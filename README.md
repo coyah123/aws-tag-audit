@@ -93,6 +93,7 @@ Keep `aws_tag_audit.py` in the same folder, because the GUI uses its scan and ta
    - **Set on ticked** sets it on the ticked rows that are shown. If nothing is ticked, it uses the highlighted rows instead.
    - **Set on all shown** sets it on every row in the list. Use the filter first, for example `ec2:volume` or `us-gov-west-1`.
    - **Clear pending (ticked)** removes pending values from the ticked rows.
+   - **Untick all** clears every tick (also on the right-click menu).
    - **Tick a whole EKS cluster** (dropdown), or right-click any row in a cluster and choose *Tick everything in EKS cluster …*: ticks the cluster, its nodegroups, nodes, node volumes and interfaces, launch templates, Auto Scaling groups and security groups in one go. Pod resources stay out. This ignores **Only show non-compliant**: ticked rows always stay in the list, compliant or not. Rows hidden by the filter box or **Types** are not ticked. To overwrite values that are already there, also untick **only where missing**.
    - **Double-click a tag cell** to edit a single resource.
    - With "only where missing" ticked, resources that already have a value for that key are left alone.
