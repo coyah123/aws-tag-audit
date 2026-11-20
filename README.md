@@ -70,7 +70,10 @@ Keep `aws_tag_audit.py` in the same folder, because the GUI uses its scan and ta
 
 1. **Connect.** Pick an AWS CLI profile (or `(default)`) and a starting region, then click Connect. See [Signing in](#signing-in). The account, partition and caller are shown, and your account's enabled regions load into a checklist.
 2. **Regions.** Tick the regions to scan. All / None buttons are provided.
-3. **Required tag keys.** Add every key you require, for example `Program` and `Owner`. A resource is flagged if it is missing *any* of them. You can add or remove keys **after** a scan and the table updates instantly, because the scan keeps every resource's full tag set.
+3. **Required tag keys.** Add every key you require, for example `Program`, `Owner` and `CostCenter`. A resource is flagged if it is missing *any* of them, and each key gets its own column.
+   - After a scan, the key box becomes a dropdown of every tag key used in your account, most common first. Picking one adds it.
+   - Keys stamped automatically by AWS or Kubernetes (`aws:`, `eks:`, `kubernetes.io/…`) are not suggested.
+   - You can add or remove keys **after** a scan and the table updates instantly, because the scan keeps every resource's full tag set.
 4. **Resource types.** A checklist of every resource type, grouped by service.
    - Click a service to toggle all of its types, or expand it to pick individual types (for example only `ec2 › volume`).
    - Your own custom types appear under **★ custom**. See [Custom resource types](#custom-resource-types) below.
@@ -78,7 +81,10 @@ Keep `aws_tag_audit.py` in the same folder, because the GUI uses its scan and ta
 5. **Scan.** The table shows one column per required key:
    - the existing value, or `✗ missing`, `✗ (empty)` or `✗ program=x` (wrong case)
    - red rows are non-compliant, green rows are compliant, yellow rows have a pending change
-   - the filter box and the "Only show non-compliant" toggle narrow the list, and you can click a column header to sort
+   - The filter box and the "Only show non-compliant" toggle narrow the list, and you can click a column header to sort.
+   - **Types ▾** opens a checklist of every resource type in the results, with "non-compliant / total" counts. Untick types to hide them from the list, and the button shows "Types: 4 of 12". **Only types with gaps** ticks just the types that still need tags.
+   - **Hide Kubernetes workloads** is on by default. See [EKS and Kubernetes](#eks-and-kubernetes).
+   - "Set on all shown" and Export only affect the rows currently shown, so filter first and then tag.
 6. **Set values.** Choose a key and type a value. Then:
    - **Set on selected** (Ctrl+A, or ⌘A on a Mac, selects all shown rows), or **Set on all shown**. Use the filter first, for example `ec2:volume` or `us-gov-west-1`.
    - **Double-click a tag cell** to edit a single resource.
@@ -168,18 +174,22 @@ python aws_tag_audit.py scan --services opensearch:domain ec2:volume            
 python aws_tag_audit.py scan                                  # all enabled regions
 python aws_tag_audit.py scan --profile work --region us-gov-west-1
 python aws_tag_audit.py scan --regions us-east-1 us-west-2 --services ec2 s3 rds
+python aws_tag_audit.py scan --key Program Owner CostCenter   # require several keys
 ```
+
+`--key` defaults to `Program`. With several keys, a resource is listed if it is missing **any** of them, and the summary shows a count for each key per resource type.
 
 This writes three files to `./tag-audit-output/`:
 
 | File | Contents |
 |---|---|
-| `<acct>_<time>_untagged.csv` | **The list.** One row per resource missing `Program`. The first column is `Program` and starts empty. |
-| `<acct>_<time>_inventory.csv` | Every resource found, with a `has_Program` yes/no column |
+| `<acct>_<time>_untagged.csv` | **The list.** One row per resource missing a key. It starts with one empty column per key for you to fill in (`Program`, `Owner`, …), then a `<key>_status` column for each key. |
+| `<acct>_<time>_inventory.csv` | Every resource found, with a `has_<key>` yes/no column per key and a `k8s_workload` column |
 | `<acct>_<time>_scan_errors.csv` | Collectors that failed, usually AccessDenied or a service that doesn't exist in that region |
 
-The `reason` column says why a resource is on the list:
-- `missing`: no `Program` key at all
+Each `<key>_status` column says where that key stands:
+- `ok`: the resource already has it. Leave the value blank and nothing changes.
+- `missing`: no such key at all
 - `empty-value`: the key is there but the value is blank
 - `wrong-case-key: program`: the key is spelled with different casing. AWS tag keys are case-sensitive, so this one doesn't count as tagged.
 
@@ -236,6 +246,8 @@ Your answers are saved to `..._untagged_answers.csv`, so you can quit and resume
 
 ```bash
 python aws_tag_audit.py apply --csv ..._untagged.csv --value ALPHA --services ec2:volume ec2:snapshot --regions us-east-1
+# several keys: give each one
+python aws_tag_audit.py apply --csv ..._untagged.csv --value Program=ALPHA --value Owner=platform --services eks
 ```
 
 Before anything changes, `apply` always shows a summary (for example "set Program on N resources: 40×ALPHA, 12×BRAVO") and asks y/N. Use `--yes` to skip that question.
@@ -247,13 +259,41 @@ It also **refuses to run if the CSV is from a different account** than the one y
 - It only *adds or overwrites* the `Program` key. Other tags are never touched. For S3, existing tags are read and merged first, because `PutBucketTagging` would otherwise replace them all.
 - It uses `tag:TagResources` first, in batches of 20 per region.
 - If that fails for a resource, it falls back to the service's own API: EC2 `CreateTags`, IAM `TagRole`/`TagUser`/`TagPolicy`, Route 53, S3, Logs, Lambda, SQS.
-- Every row ends up in `..._results_<time>.csv` with `status` (`tagged` or `failed`) and a `message`. You can fix the failed rows and feed that results file straight back into `apply --csv`.
+- Every change ends up in `..._results_<time>.csv`, one row per resource and key, with `status` (`tagged` or `failed`), `tag_key` and a `message`. Feed that results file straight back into `apply --csv` to retry **only the failed changes**.
+- `apply` finds the key columns in the CSV by itself. Pass `--key` only to limit it, for example `--key Owner`. `--interactive` asks key by key.
 
 Tag values are limited to 256 characters, using letters, numbers, spaces and `_ . : / = + - @`.
 
 ### Verify
 
 Run `scan` again. Anything you tagged will be gone from the untagged list.
+
+## EKS and Kubernetes
+
+For EKS, the tool lists the **cluster and its infrastructure**:
+
+| Listed | Type |
+|---|---|
+| Clusters | `eks:cluster` |
+| Managed nodegroups | `eks:nodegroup` |
+| Fargate profiles | `eks:fargateprofile` |
+| Add-ons | `eks:addon` |
+| Nodes | `ec2:instance` (named and tagged by the nodegroup) |
+| Node launch templates, Auto Scaling groups, cluster security group | their normal EC2 / Auto Scaling types |
+
+Things Kubernetes creates **for workloads** are *not* listed by default, because they come and go with pods and are owned by the cluster rather than by you. They are recognised by the tags and descriptions that EKS and its controllers put on them:
+
+| Left out | How it's recognised |
+|---|---|
+| PersistentVolume EBS/EFS/FSx volumes | `kubernetes.io/created-for/…`, `CSIVolumeName`, `ebs.csi.aws.com/…` tags |
+| Pod network interfaces (VPC CNI, security groups for pods) | `aws-K8S-…` / `aws-k8s-branch-eni` description, `node.k8s.amazonaws.com/…` tags |
+| Load balancers, target groups and security groups made for Services/Ingresses | `elbv2.k8s.aws/…`, `ingress.k8s.aws/…`, `service.k8s.aws/…`, `kubernetes.io/service-name` tags |
+| EKS pod identity associations | resource type |
+
+- **GUI:** untick **Hide Kubernetes workloads** to see them. The counts line shows how many are hidden, and the log lists them by kind.
+- **CLI:** they're left out of `*_untagged.csv`. The summary prints how many were left out, and `--include-k8s-workloads` lists them. The inventory CSV always includes them, with a `k8s_workload` column.
+
+Tagging EKS resources uses the Tagging API first, then the EKS `TagResource` API as a fallback.
 
 ## Good to know
 
@@ -294,10 +334,10 @@ Services that aren't available in a region are silently skipped (`ServiceNotInRe
 ## Options
 
 ```
-common:  --profile  --region  --key Program  --regions r1 r2  --services ec2 s3 ec2:volume  --workers 8  --types-file F
+common:  --profile  --region  --key K1 [K2 ...]  --regions r1 r2  --services ec2 s3 ec2:volume eks  --workers 8  --types-file F
 types:   --test NAME
-scan:    --exclude-services logs ec2:network-interface   --no-tagging-api   --out DIR
-apply:   --csv FILE  -i/--interactive  --value V  --overwrite-csv-values  --dry-run  -y/--yes
+scan:    --exclude-services logs ec2:network-interface   --no-tagging-api   --include-k8s-workloads   --out DIR
+apply:   --csv FILE  -i/--interactive  --value [KEY=]V (repeatable)  --overwrite-csv-values  --dry-run  -y/--yes
 ```
 
-`--key` lets you audit or apply any other tag key, for example `--key CostCenter`. The CSV column is named after the key.
+`--key` takes one or more tag keys, for example `--key Program Owner CostCenter`. Each gets its own CSV column.

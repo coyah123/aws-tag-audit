@@ -130,13 +130,14 @@ class CheckList(ttk.Frame):
             step = int(-e.delta / 120) or (-1 if e.delta > 0 else 1)
         self.canvas.yview_scroll(step, "units")
 
-    def set_items(self, names, checked=True, cols=2):
+    def set_items(self, names, checked=True, cols=2, labels=None):
         for w in self.inner.winfo_children():
             w.destroy()
         self.vars = {}
         for i, n in enumerate(names):
             v = tk.BooleanVar(value=checked(n) if callable(checked) else checked)
-            ttk.Checkbutton(self.inner, text=n, variable=v).grid(row=i // cols, column=i % cols, sticky="w", padx=(2, 10))
+            ttk.Checkbutton(self.inner, text=(labels or {}).get(n, n), variable=v).grid(
+                row=i // cols, column=i % cols, sticky="w", padx=(2, 10))
             self.vars[n] = v
 
     def selected(self):
@@ -512,14 +513,18 @@ class App(tk.Tk):
         # --- left: tag keys
         kf = ttk.LabelFrame(left, text=" 2. Required tag keys ", padding=6)
         kf.pack(fill="x", pady=6)
-        ttk.Label(kf, text="Flag resources missing ANY of these (case-sensitive):", foreground="#555").pack(anchor="w")
+        ttk.Label(kf, text="Flag resources missing ANY of these (case-sensitive).\n"
+                           "Type a key or pick one found in your account (after a scan):",
+                  foreground="#555", justify="left").pack(anchor="w")
         self.keys_lb = tk.Listbox(kf, height=4, selectmode="extended", exportselection=False)
         self.keys_lb.pack(fill="x", pady=4)
         self.keys_lb.insert("end", "Program")
         row = ttk.Frame(kf)
         row.pack(fill="x")
-        self.key_entry = ttk.Entry(row)
+        # Type any key, or pick one from the dropdown (filled with every tag key found by the last scan).
+        self.key_entry = ttk.Combobox(row, values=[])
         self.key_entry.pack(side="left", fill="x", expand=True)
+        self.key_entry.bind("<<ComboboxSelected>>", lambda e: self.add_key())
         self.key_entry.bind("<Return>", lambda e: self.add_key())
         ttk.Button(row, text="Add", width=6, command=self.add_key).pack(side="left", padx=4)
         ttk.Button(row, text="Remove", width=8, command=self.remove_key).pack(side="left")
@@ -561,8 +566,14 @@ class App(tk.Tk):
         ttk.Entry(fb, textvariable=self.filter_var, width=30).pack(side="left", padx=4)
         self.only_bad = tk.BooleanVar(value=True)
         ttk.Checkbutton(fb, text="Only show non-compliant", variable=self.only_bad, command=self.refresh).pack(side="left", padx=8)
-        self.count_lbl = ttk.Label(fb, text="")
-        self.count_lbl.pack(side="right")
+        self.hide_k8s = tk.BooleanVar(value=True)
+        ttk.Checkbutton(fb, text="Hide Kubernetes workloads", variable=self.hide_k8s,
+                        command=self.refresh).pack(side="left", padx=(0, 8))
+        self.type_filter = {}  # "service:type" -> shown?
+        self.types_btn = ttk.Button(fb, text="Types: all ▾", command=self.open_type_filter)
+        self.types_btn.pack(side="left")
+        self.count_lbl = ttk.Label(right, text="", foreground="#444")
+        self.count_lbl.pack(anchor="w", pady=(3, 0))
 
         # --- right: table
         tf = ttk.Frame(right)
@@ -866,8 +877,21 @@ class App(tk.Tk):
             self.resources = resources
             self.pending = {}
             self.refresh()
-            bad = sum(1 for r in resources if self._noncompliant(r))
+            bad = sum(1 for r in resources if self._noncompliant(r) and not r.get("k8s"))
             self.log("Scan complete: %d resources, %d non-compliant for %s." % (len(resources), bad, ", ".join(self.keys())))
+            k8s = Counter(r["k8s"] for r in resources if r.get("k8s"))
+            if k8s:
+                self.log("Kubernetes workload resources (hidden while 'Hide Kubernetes workloads' is ticked): " +
+                         ", ".join("%s x%d" % kv for kv in k8s.most_common()))
+            # Suggest keys people choose; skip ones AWS/Kubernetes controllers stamp automatically.
+            system = ("aws:", "eks:", "karpenter.", "kubernetes.io", "k8s.", "CSIVolume")
+            found = Counter(k for r in resources if not r.get("k8s") for k in r["tags"]
+                            if not k.startswith(system) and "k8s.aws/" not in k and "kubernetes.io/" not in k
+                            and ".k8s.amazonaws.com/" not in k)
+            self.key_entry.configure(values=[k for k, _ in found.most_common()])
+            if found:
+                self.log("%d distinct tag keys found; pick any from the dropdown in section 2 to require it. Most common: %s" % (
+                    len(found), ", ".join("%s (%d)" % kv for kv in found.most_common(8))))
             api_only = Counter("%s:%s" % (r["service"], r["type"]) for r in resources if r["source"] == "tagging-api")
             if api_only:
                 self.log("Types found only via the Tagging API (never-tagged ones of these are invisible to it; "
@@ -949,12 +973,70 @@ class App(tk.Tk):
     def _noncompliant(self, r):
         return any(core.evaluate(r["tags"], k) for k in self.keys())
 
+    @staticmethod
+    def _tkey(r):
+        return "%s:%s" % (r["service"], r["type"])
+
+    def _in_scope(self, r):
+        """Not hidden by the Kubernetes-workload toggle (type filter is separate)."""
+        return not (self.hide_k8s.get() and r.get("k8s"))
+
+    def open_type_filter(self):
+        if getattr(self, "_tf_win", None) is not None and self._tf_win.winfo_exists():
+            self._tf_win.lift()
+            return
+        if not self.resources:
+            messagebox.showinfo("No results yet", "Run a scan first; this filters the results by resource type.")
+            return
+        win = tk.Toplevel(self)
+        self._tf_win = win
+        win.title("Show resource types")
+        win.transient(self)
+        win.geometry("+%d+%d" % (self.types_btn.winfo_rootx(), self.types_btn.winfo_rooty() + self.types_btn.winfo_height() + 4))
+        total, bad = Counter(), Counter()
+        for r in self.resources:
+            if self._in_scope(r):
+                total[self._tkey(r)] += 1
+                if self._noncompliant(r):
+                    bad[self._tkey(r)] += 1
+        names = sorted(total)
+        labels = {t: "%s   (%d non-compliant / %d)" % (t, bad[t], total[t]) for t in names}
+        ttk.Label(win, text="Tick the resource types to show in the list:", padding=(8, 8, 8, 2)).pack(anchor="w")
+        bar = ttk.Frame(win, padding=(8, 0))
+        bar.pack(fill="x")
+        cl = CheckList(win, height=min(420, 26 * len(names) + 10))
+
+        def set_all(v, only_bad=False):
+            for t, var in cl.vars.items():
+                var.set(bool(bad[t]) if only_bad else v)
+        ttk.Button(bar, text="All", width=5, command=lambda: set_all(True)).pack(side="left")
+        ttk.Button(bar, text="None", width=5, command=lambda: set_all(False)).pack(side="left", padx=2)
+        ttk.Button(bar, text="Only types with gaps", command=lambda: set_all(None, True)).pack(side="left", padx=2)
+        cl.pack(fill="both", expand=True, padx=8, pady=6)
+        cl.set_items(names, lambda t: self.type_filter.get(t, True), cols=1, labels=labels)
+
+        def changed(*_):
+            for t, var in cl.vars.items():
+                self.type_filter[t] = var.get()
+            self.refresh()
+        for var in cl.vars.values():
+            var.trace_add("write", changed)
+        ttk.Button(win, text="Close", command=win.destroy).pack(anchor="e", padx=8, pady=(0, 8))
+
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         keys = self.keys()
         needle = self.filter_var.get().strip().lower()
         rows = []
+        self._k8s_hidden = 0
+        present = set()
         for i, r in enumerate(self.resources):
+            if not self._in_scope(r):
+                self._k8s_hidden += 1
+                continue
+            present.add(self._tkey(r))
+            if not self.type_filter.get(self._tkey(r), True):
+                continue
             bad = self._noncompliant(r)
             has_pending = any((i, k) in self.pending for k in keys)
             if self.only_bad.get() and not bad and not has_pending:
@@ -971,6 +1053,8 @@ class App(tk.Tk):
         for i, vals, tag in rows:
             self.tree.insert("", "end", iid=str(i), values=vals, tags=(tag,))
         self._shown = len(rows)
+        off = [t for t in present if not self.type_filter.get(t, True)]
+        self.types_btn.configure(text=("Types: %d of %d ▾" % (len(present) - len(off), len(present))) if off else "Types: all ▾")
         self._update_counts()
 
     def _pending_items(self):
@@ -978,10 +1062,13 @@ class App(tk.Tk):
         return {k: v for k, v in self.pending.items() if k[1] in ks}
 
     def _update_counts(self):
-        bad = sum(1 for r in self.resources if self._noncompliant(r))
+        scope = [r for r in self.resources if self._in_scope(r)]
+        bad = sum(1 for r in scope if self._noncompliant(r))
         p = self._pending_items()
-        self.count_lbl.configure(text="%d shown  |  %d selected  |  %d of %d non-compliant  |  %d pending" % (
-            getattr(self, "_shown", 0), len(self.tree.selection()), bad, len(self.resources), len(p)))
+        k8s = getattr(self, "_k8s_hidden", 0)
+        self.count_lbl.configure(text="%d shown  |  %d selected  |  %d of %d non-compliant  |  %d pending%s" % (
+            getattr(self, "_shown", 0), len(self.tree.selection()), bad, len(scope), len(p),
+            ("  |  %d k8s workloads hidden" % k8s) if k8s else ""))
         n_res = len({i for i, _ in p})
         self.apply_btn.configure(text="Apply %d pending changes (%d resources)" % (len(p), n_res),
                                  state="normal" if p and not self.busy else "disabled")
@@ -1116,14 +1203,14 @@ class App(tk.Tk):
                 continue
             row = {"compliant": "no" if self._noncompliant(r) else "yes", "service": r["service"], "type": r["type"],
                    "region": r["region"], "name": r["name"], "id": r["id"], "arn": r["arn"], "source": r["source"],
-                   "tags_json": core.json.dumps(r["tags"], sort_keys=True)}
+                   "k8s_workload": r.get("k8s", ""), "tags_json": core.json.dumps(r["tags"], sort_keys=True)}
             for k in keys:
                 row[k] = r["tags"].get(k, "")
                 row[k + "_status"] = core.evaluate(r["tags"], k) or "ok"
                 row[k + "_pending"] = self.pending.get((i, k), "")
             rows.append(row)
         fields = ["compliant", "service", "type", "region", "name", "id"] + \
-                 [f for k in keys for f in (k, k + "_status", k + "_pending")] + ["arn", "source", "tags_json"]
+                 [f for k in keys for f in (k, k + "_status", k + "_pending")] + ["arn", "source", "k8s_workload", "tags_json"]
         core.write_csv(path, rows, fields)
         self.log("Exported %d rows (what's currently shown) to %s" % (len(rows), path))
 

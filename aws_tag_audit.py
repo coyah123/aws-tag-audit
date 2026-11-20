@@ -234,12 +234,69 @@ def ecs_clusters(ctx, region):
             yield res("ecs", "cluster", region, cl["clusterName"], cl["clusterArn"], tags, name=cl["clusterName"])
 
 
-@collector("eks")
+# EKS: the cluster and its AWS-level infrastructure only (cluster, nodegroups, Fargate profiles,
+# add-ons). Nodes are EC2 instances (ec2:instance). Things Kubernetes creates for workloads
+# (PVC volumes, pod ENIs, Service/Ingress load balancers) are flagged by k8s_workload_reason().
+@collector("eks:cluster", "eks")
 def eks_clusters(ctx, region):
     c = ctx.client("eks", region)
     for name in paginate(c, "list_clusters", "clusters"):
         cl = c.describe_cluster(name=name)["cluster"]
         yield res("eks", "cluster", region, name, cl["arn"], cl.get("tags", {}), name=name)
+
+
+@collector("eks:nodegroup", "eks")
+def eks_nodegroups(ctx, region):
+    c = ctx.client("eks", region)
+    for cl in paginate(c, "list_clusters", "clusters"):
+        for ng in paginate(c, "list_nodegroups", "nodegroups", clusterName=cl):
+            d = c.describe_nodegroup(clusterName=cl, nodegroupName=ng)["nodegroup"]
+            yield res("eks", "nodegroup", region, ng, d["nodegroupArn"], d.get("tags", {}), name="%s/%s" % (cl, ng))
+
+
+@collector("eks:fargateprofile", "eks")
+def eks_fargate(ctx, region):
+    c = ctx.client("eks", region)
+    for cl in paginate(c, "list_clusters", "clusters"):
+        for fp in paginate(c, "list_fargate_profiles", "fargateProfileNames", clusterName=cl):
+            d = c.describe_fargate_profile(clusterName=cl, fargateProfileName=fp)["fargateProfile"]
+            yield res("eks", "fargateprofile", region, fp, d["fargateProfileArn"], d.get("tags", {}), name="%s/%s" % (cl, fp))
+
+
+@collector("eks:addon", "eks")
+def eks_addons(ctx, region):
+    c = ctx.client("eks", region)
+    for cl in paginate(c, "list_clusters", "clusters"):
+        for ad in paginate(c, "list_addons", "addons", clusterName=cl):
+            d = c.describe_addon(clusterName=cl, addonName=ad)["addon"]
+            yield res("eks", "addon", region, ad, d["addonArn"], d.get("tags", {}), name="%s/%s" % (cl, ad))
+
+
+# Tags/descriptions that Kubernetes controllers stamp on AWS resources they create for workloads.
+K8S_VOLUME_TAGS = ("kubernetes.io/created-for/", "ebs.csi.aws.com/", "efs.csi.aws.com/", "fsx.csi.aws.com/")
+K8S_LB_TAGS = ("elbv2.k8s.aws/", "ingress.k8s.aws/", "service.k8s.aws/")
+K8S_ENI_TAGS = ("node.k8s.amazonaws.com/", "vpcresources.k8s.aws/", "cluster.k8s.amazonaws.com/")
+EKS_POD_TYPES = {"podidentityassociation"}
+
+
+def k8s_workload_reason(r):
+    """Return why a resource is a Kubernetes *workload* artifact (not cluster infrastructure), else None.
+    EKS clusters, nodegroups, node instances, their launch templates/ASGs and the cluster SG are NOT flagged."""
+    tags = r.get("tags") or {}
+    if r["service"] == "eks" and r["type"] in EKS_POD_TYPES:
+        return "EKS pod identity association"
+    if r["service"] == "ec2" and r["type"] == "network-interface":
+        desc = (r.get("name") or "").lower()
+        if desc.startswith(("aws-k8s-", "aws-k8s-branch")) or tags.get("eks:eni:owner") == "eks-vpc-resource-controller":
+            return "pod network interface (VPC CNI)"
+    for k in tags:
+        if k.startswith(K8S_VOLUME_TAGS) or k in ("CSIVolumeName", "CSIVolumeSnapshotName", "kubernetes.io/created-for/pvc/name"):
+            return "Kubernetes persistent volume"
+        if k.startswith(K8S_LB_TAGS) or k == "kubernetes.io/service-name":
+            return "Kubernetes Service/Ingress load balancer"
+        if k.startswith(K8S_ENI_TAGS):
+            return "pod network interface (VPC CNI)"
+    return None
 
 
 @collector("ecr")
@@ -923,6 +980,8 @@ def run_scan(ctx, regions, include, exclude, use_tagging_api, progress=None):
         if r["source"] == "tagging-api" and r["arn"] in ctx.skipped_arns:
             continue
         merged.setdefault(r["arn"], r)
+    for r in merged.values():
+        r["k8s"] = k8s_workload_reason(r) or ""
     return sorted(merged.values(), key=lambda r: (r["service"], r["type"], r["region"], r["name"], r["id"]))
 
 
@@ -957,18 +1016,25 @@ def cmd_scan(args):
 
     t0 = time.time()
     resources = run_scan(ctx, regions, include, exclude, not args.no_tagging_api)
-    key = args.key
+    keys = args.key or ["Program"]
 
-    untagged = []
+    untagged, k8s_skipped = [], Counter()
     for r in resources:
-        reason = evaluate(r["tags"], key)
         r["tags_json"] = json.dumps(r["tags"], sort_keys=True)
-        r["has_" + key] = "no" if reason else "yes"
-        if reason:
-            row = dict(r)
-            row[key] = ""
-            row["reason"] = reason
-            untagged.append(row)
+        r["k8s_workload"] = r.get("k8s", "")
+        reasons = {k: evaluate(r["tags"], k) for k in keys}
+        for k in keys:
+            r["has_" + k] = "no" if reasons[k] else "yes"
+        if not any(reasons.values()):
+            continue
+        if r["k8s_workload"] and not args.include_k8s_workloads:
+            k8s_skipped[r["k8s_workload"]] += 1
+            continue
+        row = dict(r)
+        for k in keys:
+            row[k] = ""                               # you fill this in
+            row[k + "_status"] = reasons[k] or "ok"   # missing / empty-value / wrong-case-key / ok
+        untagged.append(row)
 
     os.makedirs(args.out, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -977,25 +1043,39 @@ def cmd_scan(args):
     inv_path = base + "_inventory.csv"
     err_path = base + "_scan_errors.csv"
 
-    # Tag-value column FIRST so it's easy to fill in Excel.
-    write_csv(untagged_path, untagged, [key, "reason", "service", "type", "region", "name", "id", "arn", "source", "tags_json"])
-    write_csv(inv_path, resources, ["has_" + key, "service", "type", "region", "name", "id", "arn", "source", "tags_json"])
+    # Tag-value columns FIRST so they're easy to fill in Excel.
+    common = ["service", "type", "region", "name", "id", "arn", "source", "tags_json"]
+    write_csv(untagged_path, untagged, keys + [k + "_status" for k in keys] + common)
+    write_csv(inv_path, resources, ["has_" + k for k in keys] + ["k8s_workload"] + common)
     with open(err_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["collector", "region", "error_code", "message"])
         w.writerows(sorted(ctx.scan_errors))
 
     # Summary
-    print("\nScan finished in %.0fs: %d resources, %d missing tag '%s'." % (time.time() - t0, len(resources), len(untagged), key))
+    label = ", ".join("'%s'" % k for k in keys)
+    print("\nScan finished in %.0fs: %d resources, %d missing %s%s." % (
+        time.time() - t0, len(resources), len(untagged), "at least one of " if len(keys) > 1 else "tag ", label))
     if untagged:
-        by_type = Counter("%s:%s" % (r["service"], r["type"]) for r in untagged)
-        print("\nMissing '%s' by resource type:" % key)
-        for t, n in by_type.most_common():
-            print("  %6d  %s" % (n, t))
+        print("\nMissing by resource type:" + ("".join("  %10s" % k[:10] for k in keys) if len(keys) > 1 else ""))
+        by_type = defaultdict(Counter)
+        for r in untagged:
+            t = "%s:%s" % (r["service"], r["type"])
+            by_type[t]["_"] += 1
+            for k in keys:
+                if r[k + "_status"] != "ok":
+                    by_type[t][k] += 1
+        for t, c in sorted(by_type.items(), key=lambda kv: -kv[1]["_"]):
+            print("  %6d  %-34s%s" % (c["_"], t, "".join("  %10d" % c[k] for k in keys) if len(keys) > 1 else ""))
         by_region = Counter(r["region"] for r in untagged)
-        print("\nMissing '%s' by region:" % key)
+        print("\nMissing by region:")
         for t, n in by_region.most_common():
             print("  %6d  %s" % (n, t))
+    if k8s_skipped:
+        print("\nLeft out %d Kubernetes workload resources (not cluster infrastructure); add --include-k8s-workloads to list them:"
+              % sum(k8s_skipped.values()))
+        for why, n in k8s_skipped.most_common():
+            print("  %6d  %s" % (n, why))
     blocked, real_errors = summarize_errors(ctx)
     if blocked:
         print("\nRegions where almost every call was denied (SCP region restriction or not opted in), "
@@ -1006,7 +1086,8 @@ def cmd_scan(args):
             print("  %6d  %s" % (n, code))
     print("\nUntagged list : %s" % untagged_path)
     print("Full inventory: %s" % inv_path)
-    print("\nNext: fill the '%s' column in the untagged CSV, then run:\n  python %s apply --csv \"%s\"" % (key, os.path.basename(sys.argv[0]), untagged_path))
+    print("\nNext: fill the %s column%s in the untagged CSV, then run:\n  python %s apply --csv \"%s\"" % (
+        label, "s" if len(keys) > 1 else "", os.path.basename(sys.argv[0]), untagged_path))
     print("  (or add --interactive to be prompted for each resource)")
 
 
@@ -1055,6 +1136,8 @@ def native_tag(ctx, row, key, val):
         ctx.client("logs", region).tag_log_group(logGroupName=rid, tags={key: val})
     elif svc == "lambda":
         ctx.client("lambda", region).tag_resource(Resource=arn, Tags={key: val})
+    elif svc == "eks":
+        ctx.client("eks", region).tag_resource(resourceArn=arn, tags={key: val})
     elif svc == "sqs":
         url = ctx.client("sqs", region).get_queue_url(QueueName=rid)["QueueUrl"]
         ctx.client("sqs", region).tag_queue(QueueUrl=url, Tags={key: val})
@@ -1168,11 +1251,23 @@ def describe_row(row):
     return "%s:%s  %s  %s  (%s)\n      tags: %s" % (row["service"], row["type"], row["region"], row["name"] or "-", row["id"], tag_s[:300])
 
 
+def row_needs(row, key):
+    """Does this CSV row still need a value for `key`? (blank value and not already compliant)"""
+    if (row.get(key) or "").strip():
+        return False
+    status = row.get(key + "_status")
+    if status is None and "reason" in row:      # CSVs from older single-key versions
+        status = row["reason"] or "missing"
+    return status != "ok"
+
+
 def interactive_collect(rows, key):
-    """Prompt for a value per resource. Returns {index: value}."""
+    """Prompt for a `key` value per resource that needs one. Returns {index: value}."""
     answers = {}
     last = None
-    todo = [i for i, r in enumerate(rows) if not (r.get(key) or "").strip()]
+    todo = [i for i, r in enumerate(rows) if row_needs(r, key)]
+    if not todo:
+        return answers
     print("\n%d resources need a '%s' value. For each one type the value and press Enter." % (len(todo), key))
     print("  Enter = skip   .  = same as previous   .all = previous value for ALL remaining of this service:type   q = stop asking\n")
     n = 0
@@ -1212,15 +1307,28 @@ def interactive_collect(rows, key):
     return answers
 
 
+def csv_keys(header):
+    """Tag-key columns in a scan/answers/results CSV: every X that has an X_status column."""
+    ks = [h[:-7] for h in header if h.endswith("_status") and h[:-7] in header]
+    if not ks and "reason" in header and "Program" in header:
+        ks = ["Program"]
+    return ks
+
+
 def cmd_apply(args):
-    key = args.key
     rows = read_rows(args.csv)
     if not rows:
         sys.exit("CSV is empty.")
-    if key not in rows[0]:
-        sys.exit("CSV has no '%s' column. Was it produced by 'scan' with the same --key?" % key)
+    header = list(rows[0].keys())
+    keys = args.key or csv_keys(header) or ["Program"]
+    missing_cols = [k for k in keys if k not in header]
+    if missing_cols:
+        sys.exit("CSV has no column for %s. Was it produced by 'scan' with the same --key?" % ", ".join(missing_cols))
 
-    # Optional filters
+    # Re-running on a results CSV: only retry what didn't succeed.
+    if "status" in header:
+        rows = [r for r in rows if r.get("status") != "tagged"]
+
     def keep(r):
         if args.services and r["service"] not in args.services and "%s:%s" % (r["service"], r["type"]) not in args.services:
             return False
@@ -1228,38 +1336,50 @@ def cmd_apply(args):
             return False
         return True
     rows = [r for r in rows if keep(r)]
+    if not rows:
+        print("Nothing to do: no rows left after filters.")
+        return
 
-    if args.value is not None:
-        if not valid_value(args.value):
-            sys.exit("Invalid --value. Max 256 chars; letters, numbers, spaces and _ . : / = + - @ only.")
+    # --value VALUE (single key) or --value KEY=VALUE (repeatable)
+    for spec in args.value or []:
+        k, sep, v = spec.partition("=")
+        if sep and k in keys:
+            pass
+        elif len(keys) == 1:
+            k, v = keys[0], spec
+        else:
+            sys.exit("With several keys, use --value KEY=VALUE (keys: %s)" % ", ".join(keys))
+        if not valid_value(v):
+            sys.exit("Invalid value %r. Max 256 chars; letters, numbers, spaces and _ . : / = + - @ only." % v)
         for r in rows:
-            if not (r.get(key) or "").strip() or args.overwrite_csv_values:
-                r[key] = args.value
+            if row_needs(r, k) or (args.overwrite_csv_values and (r.get(k) or "").strip()):
+                r[k] = v
 
     if args.interactive:
-        answers = interactive_collect(rows, key)
-        for i, v in answers.items():
-            rows[i][key] = v
-        stem = os.path.splitext(args.csv)[0]
-        ans_path = stem + "_answers.csv"
+        for k in keys:
+            for i, v in interactive_collect(rows, k).items():
+                rows[i][k] = v
+        ans_path = os.path.splitext(args.csv)[0] + "_answers.csv"
         write_csv(ans_path, rows, list(rows[0].keys()))
         print("\nYour answers were saved to %s (re-run apply on that file to resume)." % ans_path)
 
-    plan, bad = [], []
-    for r in rows:
-        v = (r.get(key) or "").strip()
-        if not v:
-            continue
-        (plan if valid_value(v) else bad).append((r, v))
-    for r, v in bad:
-        print("SKIP invalid value %r for %s" % (v, r["arn"]))
-    if not plan:
-        print("Nothing to do: no rows have a '%s' value." % key)
+    plans, bad = {}, []
+    for k in keys:
+        for r in rows:
+            v = (r.get(k) or "").strip()
+            if v:
+                (plans.setdefault(k, []) if valid_value(v) else bad).append((r, v) if valid_value(v) else (r, k, v))
+    for r, k, v in bad:
+        print("SKIP invalid %s value %r for %s" % (k, v, r["arn"]))
+    if not plans:
+        print("Nothing to do: no rows have a value in %s." % ", ".join("'%s'" % k for k in keys))
         return
 
-    print("\nPlan: set tag '%s' on %d resources (%d rows left blank are skipped)." % (key, len(plan), len(rows) - len(plan) - len(bad)))
-    for v, n in Counter(v for _, v in plan).most_common():
-        print("  %6d  %s=%s" % (n, key, v))
+    total = sum(len(p) for p in plans.values())
+    print("\nPlan: %d tag changes on %d resources." % (total, len({r["arn"] for p in plans.values() for r, _ in p})))
+    for k, p in plans.items():
+        for v, n in Counter(v for _, v in p).most_common():
+            print("  %6d  %s=%s" % (n, k, v))
     if not args.dry_run and not args.yes:
         if input("\nApply these tags now? [y/N] ").strip().lower() not in ("y", "yes"):
             print("Aborted, nothing changed.")
@@ -1268,20 +1388,28 @@ def cmd_apply(args):
     ctx = Ctx(args.profile, args.region, args.workers)
     print("Account %s  caller %s\n" % (ctx.account, ctx.caller_arn))
     # Guard against applying a CSV from another account.
-    accts = {r["arn"].split(":")[4] for r, _ in plan if r["arn"].split(":")[4]}
+    accts = {r["arn"].split(":")[4] for p in plans.values() for r, _ in p if r["arn"].count(":") >= 5 and r["arn"].split(":")[4]}
     if accts and accts != {ctx.account}:
         sys.exit("CSV contains resources from account(s) %s but you're logged into %s. Refusing." % (", ".join(sorted(accts)), ctx.account))
 
-    results = apply_tags(ctx, plan, key, args.dry_run)
+    results = []
+    for k, p in plans.items():
+        for r in apply_tags(ctx, p, k, args.dry_run):
+            for other in keys:          # each result row carries only its own key's value,
+                if other != k:          # so re-applying the results CSV retries just that key
+                    r[other] = ""
+            r["tag_key"] = k
+            results.append(r)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = os.path.splitext(args.csv)[0] + "_results_%s.csv" % stamp
-    fields = ["status", "message", key] + [f for f in results[0].keys() if f not in ("status", "message", key)]
+    first = ["status", "message", "tag_key"] + keys
+    fields = first + [f for f in results[0].keys() if f not in first]
     write_csv(out, results, fields)
     c = Counter(r["status"] for r in results)
     print("\nDone: %s" % ", ".join("%s=%d" % kv for kv in c.items()))
     print("Results: %s" % out)
     if c.get("failed"):
-        print("Failed rows can be fixed and re-applied straight from the results CSV:\n  python %s apply --csv \"%s\" --services <svc>" % (os.path.basename(sys.argv[0]), out))
+        print("Retry just the failed ones (fix values first if needed):\n  python %s apply --csv \"%s\"" % (os.path.basename(sys.argv[0]), out))
 
 
 # --------------------------------------------------------------------------- #
@@ -1331,7 +1459,9 @@ def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--profile", help="AWS CLI profile to use")
     common.add_argument("--region", help="Starting region for API calls (default: profile/env region)")
-    common.add_argument("--key", default="Program", help="Tag key to check/set (default: Program, case-sensitive)")
+    common.add_argument("--key", nargs="+", metavar="KEY",
+                        help="Tag key(s) to require, case-sensitive, e.g. --key Program Owner CostCenter "
+                             "(scan default: Program; apply default: the key columns found in the CSV)")
     common.add_argument("--regions", nargs="+", help="Limit to these regions (default: all enabled)")
     common.add_argument("--services", nargs="+", help="Limit to these services, e.g. ec2 s3 rds iam ec2:volume")
     common.add_argument("--workers", type=int, default=8, help="Parallel API workers (default 8)")
@@ -1346,12 +1476,16 @@ def main(argv=None):
     s.add_argument("--exclude-services", nargs="+", help="Skip these collectors, e.g. logs ec2:network-interface")
     s.add_argument("--no-tagging-api", action="store_true", help="Don't use the Resource Groups Tagging API catch-all")
     s.add_argument("--out", default="tag-audit-output", help="Output directory (default ./tag-audit-output)")
+    s.add_argument("--include-k8s-workloads", action="store_true",
+                   help="Also list AWS resources Kubernetes creates for workloads (PVC volumes, pod ENIs, "
+                        "Service/Ingress load balancers). Default: only cluster infrastructure is listed")
     s.set_defaults(func=cmd_scan)
 
     a = sub.add_parser("apply", parents=[common], help="Add the tag using values from the CSV / prompts")
     a.add_argument("--csv", required=True, help="Untagged CSV produced by 'scan' (or a results/answers CSV)")
     a.add_argument("--interactive", "-i", action="store_true", help="Prompt for a value for each row that has none")
-    a.add_argument("--value", help="Use this value for every row that has none in the CSV")
+    a.add_argument("--value", action="append", metavar="[KEY=]VALUE",
+                   help="Fill rows that have no value: --value ALPHA (one key) or --value Program=ALPHA --value Owner=ops")
     a.add_argument("--overwrite-csv-values", action="store_true", help="With --value, also replace values already in the CSV")
     a.add_argument("--dry-run", action="store_true", help="Show what would be tagged, change nothing")
     a.add_argument("--yes", "-y", action="store_true", help="Don't ask for confirmation")
