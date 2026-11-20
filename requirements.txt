@@ -1,0 +1,3 @@
+boto3>=1.28
+# Optional, installed by run.sh/run.bat when possible: lets boto3 read profiles created
+# with `aws login` (browser console sign-in).  pip install "botocore[crt]"

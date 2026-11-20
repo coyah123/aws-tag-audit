@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+# scan/apply output - contains account IDs and resource ARNs
+tag-audit-output/
+*.csv
+# local custom resource types may contain account-specific commands; commit a copy deliberately if wanted
+custom_types.json
+*.tmp
+.DS_Store
