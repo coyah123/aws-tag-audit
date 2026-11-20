@@ -172,7 +172,11 @@ def _ec2_simple(rtype, op, key, id_key, kwargs=None, acct=True, skip=None, tag_k
                 ctx.skipped_arns.add(arn)
                 continue
             tags = tag_list_to_dict(it.get(tag_key))
-            yield res("ec2", rtype, region, rid, arn, tags, name=tags.get("Name") or (it.get(name_key) if name_key else None))
+            r = res("ec2", rtype, region, rid, arn, tags, name=tags.get("Name") or (it.get(name_key) if name_key else None))
+            att = [a.get("InstanceId") for a in it.get("Attachments") or [] if a.get("InstanceId")]
+            if rtype == "volume" and att:
+                r["attached_to"] = att[0]   # lets a node's untagged volume inherit the node's EKS cluster
+            yield r
     return fn
 
 
@@ -216,6 +220,8 @@ def ec2_enis(ctx, region):
         r = res("ec2", "network-interface", region, rid, arn, tag_list_to_dict(n.get("TagSet")),
                 name=n.get("Description") or None)
         r["iface"] = n.get("InterfaceType", "")
+        if (n.get("Attachment") or {}).get("InstanceId"):
+            r["attached_to"] = n["Attachment"]["InstanceId"]
         yield r
 
 
@@ -1072,6 +1078,13 @@ def run_scan(ctx, regions, include, exclude, use_tagging_api, progress=None):
     for r in merged.values():
         r["k8s"] = k8s_workload_reason(r) or ""
         r["eks_cluster"] = eks_cluster_of(r)
+    # Volumes and interfaces attached to an EKS node belong to that node's cluster,
+    # even when they carry no cluster tags themselves.
+    node_cluster = {(r["region"], r["id"]): r["eks_cluster"] for r in merged.values()
+                    if r["service"] == "ec2" and r["type"] == "instance" and r["eks_cluster"]}
+    for r in merged.values():
+        if r.get("attached_to") and r["eks_cluster"] in ("", "(eks)"):
+            r["eks_cluster"] = node_cluster.get((r["region"], r["attached_to"]), r["eks_cluster"])
     return sorted(merged.values(), key=lambda r: (r["service"], r["type"], r["region"], r["name"], r["id"]))
 
 

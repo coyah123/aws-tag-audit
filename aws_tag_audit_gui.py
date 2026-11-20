@@ -103,6 +103,57 @@ def mask(k, v):
     return "%s=%s" % (k, v)
 
 
+class WrapFrame(ttk.Frame):
+    """A button bar that wraps onto more lines when it's too narrow, so nothing falls off the edge.
+    Children are created and .pack()ed as usual; the frame takes them over and lays them out
+    left to right in creation order, keeping each child's pack padx/pady."""
+
+    def __init__(self, master, **kw):
+        super().__init__(master, **kw)
+        self._pads = {}
+        self._pending = False
+        self.bind("<Configure>", lambda e: self.reflow())
+
+    @staticmethod
+    def _two(v):
+        v = v if isinstance(v, (tuple, list)) else str(v).split()
+        v = [int(float(x)) for x in v] or [0]
+        return (v[0], v[-1])
+
+    def reflow(self, *_):
+        if self._pending:
+            return
+        self._pending = True
+        self.after_idle(self._do_reflow)
+
+    def _do_reflow(self):
+        self._pending = False
+        if not self.winfo_exists():
+            return
+        width = self.winfo_width()
+        if width <= 1:
+            width = self.master.winfo_width()
+        x = y = rowh = 0
+        for w in self.winfo_children():
+            if w.winfo_manager() == "pack":
+                info = w.pack_info()
+                self._pads[w] = self._two(info.get("padx", 0)) + self._two(info.get("pady", 0))
+                w.pack_forget()
+                w.bind("<Configure>", self.reflow, add="+")   # re-layout when its text/size changes
+            if w not in self._pads:
+                continue
+            l, r, t, b = self._pads[w]
+            ww, wh = w.winfo_reqwidth() + l + r, w.winfo_reqheight() + t + b
+            if x and width > 1 and x + ww > width:
+                x, y, rowh = 0, y + rowh + 2, 0
+            w.place(x=x + l, y=y + t)
+            x += ww
+            rowh = max(rowh, wh)
+        h = y + rowh
+        if int(self.cget("height") or 0) != h:
+            self.configure(height=h)
+
+
 class CheckList(ttk.Frame):
     """Scrollable list of checkboxes."""
 
@@ -304,7 +355,7 @@ class CustomTypeDialog(tk.Toplevel):
         ttk.Label(adv, text="ARN template variables: {partition} {region} {account} {id} {name} and any top-level field of the item, e.g. {DomainName}",
                   foreground="#777").grid(row=len(self.FIELDS), column=0, columnspan=3, sticky="w")
 
-        tr = ttk.Frame(f)
+        tr = WrapFrame(f)
         tr.grid(row=7, column=0, columnspan=2, sticky="ew")
         ttk.Label(tr, text="Test in region:").pack(side="left")
         regions = app.regions.selected() or list(app.regions.vars) or ([app.ctx.start_region] if app.ctx else [])
@@ -485,8 +536,8 @@ class App(tk.Tk):
         self.pasted_env = set()
 
         # --- top: connection
-        top = ttk.Frame(self, padding=(8, 8, 8, 4))
-        top.pack(fill="x")
+        top = WrapFrame(self)
+        top.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Label(top, text="Profile:").pack(side="left")
         try:
             profiles = ["(default)"] + core.boto3.Session().available_profiles
@@ -525,7 +576,7 @@ class App(tk.Tk):
 
         rf = ttk.LabelFrame(left, text=" 1. Regions to scan ", padding=6)
         rf.pack(fill="x")
-        bar = ttk.Frame(rf)
+        bar = WrapFrame(rf)
         bar.pack(fill="x")
         ttk.Button(bar, text="All", width=6, command=lambda: self.regions.set_all(True)).pack(side="left")
         ttk.Button(bar, text="None", width=6, command=lambda: self.regions.set_all(False)).pack(side="left", padx=4)
@@ -555,7 +606,7 @@ class App(tk.Tk):
         # --- left: resource types
         sf = ttk.LabelFrame(left, text=" 3. Resource types ", padding=6)
         sf.pack(fill="both", expand=True)
-        bar = ttk.Frame(sf)
+        bar = WrapFrame(sf)
         bar.pack(fill="x")
         ttk.Button(bar, text="Main only", command=lambda: self.types.main_only()).pack(side="left")
         ttk.Button(bar, text="All", width=4, command=lambda: self.types.set_all(True)).pack(side="left", padx=2)
@@ -579,7 +630,7 @@ class App(tk.Tk):
 
 
         # --- right: filter bar
-        fb = ttk.Frame(right)
+        fb = WrapFrame(right)
         fb.pack(fill="x")
         ttk.Label(fb, text="Filter:").pack(side="left")
         self.filter_var = tk.StringVar()
@@ -617,6 +668,8 @@ class App(tk.Tk):
         self.tree.tag_configure("ok", background="#e9f7ec", foreground="#111")
         self.tree.bind("<Double-1>", self.on_double)
         self.tree.bind("<Button-1>", self.on_click, add="+")
+        for seq in (("<Button-2>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)):
+            self.tree.bind(seq, self.on_right_click)
         self.tree.bind("<space>", lambda e: (self.toggle_checked(self.tree.selection()), "break")[1])
         self.tree.bind("<%s-a>" % MOD, lambda e: (self.tree.selection_set(self.tree.get_children()), "break")[1])
         self.tree.bind("<<TreeviewSelect>>", lambda e: (self._update_counts(), self._show_tags()))
@@ -624,43 +677,62 @@ class App(tk.Tk):
         self.tags_lbl = ttk.Label(right, text="Select a row to see all of its current tags.", foreground="#444",
                                   justify="left", wraplength=900, font=MONO)
         self.tags_lbl.pack(fill="x", anchor="w")
-        right.bind("<Configure>", lambda e: self.tags_lbl.configure(wraplength=max(300, e.width - 20)))
+        right.bind("<Configure>", lambda e: (self.tags_lbl.configure(wraplength=max(300, e.width - 20)),
+                                             self.tip_lbl.configure(wraplength=max(300, e.width - 20))))
 
         # --- right: edit bar
         eb = ttk.LabelFrame(right, text=" 4. Set tag values ", padding=6)
         eb.pack(fill="x")
-        ttk.Label(eb, text="Key").pack(side="left")
-        self.edit_key = ttk.Combobox(eb, width=16, state="readonly")
+        ebw = WrapFrame(eb)
+        ebw.pack(fill="x")
+        ttk.Label(ebw, text="Key").pack(side="left")
+        self.edit_key = ttk.Combobox(ebw, width=16, state="readonly")
         self.edit_key.pack(side="left", padx=4)
-        ttk.Label(eb, text="Value").pack(side="left")
-        self.edit_val = ttk.Entry(eb, width=26)
+        ttk.Label(ebw, text="Value").pack(side="left")
+        self.edit_val = ttk.Entry(ebw, width=26)
         self.edit_val.pack(side="left", padx=4)
         self.edit_val.bind("<Return>", lambda e: self.set_value(selected=True))
         self.only_missing = tk.BooleanVar(value=True)
-        ttk.Checkbutton(eb, text="only where missing", variable=self.only_missing).pack(side="left", padx=4)
-        ttk.Button(eb, text="Set on ticked", command=lambda: self.set_value(selected=True)).pack(side="left", padx=2)
-        ttk.Button(eb, text="Set on all shown", command=lambda: self.set_value(selected=False)).pack(side="left", padx=2)
-        ttk.Button(eb, text="Clear pending (ticked)", command=self.clear_pending).pack(side="left", padx=2)
-        ttk.Label(right, text="Tip: tick the box on each row you want (click the header box to tick every shown row, "
+        ttk.Checkbutton(ebw, text="only where missing", variable=self.only_missing).pack(side="left", padx=4)
+        ttk.Button(ebw, text="Set on ticked", command=lambda: self.set_value(selected=True)).pack(side="left", padx=2)
+        ttk.Button(ebw, text="Set on all shown", command=lambda: self.set_value(selected=False)).pack(side="left", padx=2)
+        ttk.Button(ebw, text="Clear pending (ticked)", command=self.clear_pending).pack(side="left", padx=2)
+        ttk.Label(ebw, text="Tick a whole EKS cluster:").pack(side="left", padx=(14, 2))
+        self.cluster_pick = ttk.Combobox(ebw, width=20, state="readonly", values=[])
+        self.cluster_pick.pack(side="left")
+        self.cluster_pick.bind("<<ComboboxSelected>>", lambda e: (self.tick_cluster(self.cluster_pick.get()),
+                                                                  self.cluster_pick.set("")))
+        self.tip_lbl = ttk.Label(right, text="Tip: tick the box on each row you want (click the header box to tick every shown row, "
                               "Space ticks the highlighted rows). With nothing ticked, the highlighted rows are used. "
                               "Double-click a tag cell to edit one resource. "
                               "Yellow = pending, red = non-compliant, green = compliant.",
-                  foreground="#666", wraplength=900, justify="left").pack(anchor="w", pady=(2, 0))
+                  foreground="#666", wraplength=900, justify="left")
+        self.tip_lbl.pack(anchor="w", pady=(2, 0))
 
         # --- right: action bar
-        ab = ttk.Frame(right)
+        ab = WrapFrame(right)
         ab.pack(fill="x", pady=4)
         self.dry_run = tk.BooleanVar(value=False)
         self.apply_btn = ttk.Button(ab, text="Apply 0 pending changes", style="Big.TButton", command=self.apply, state="disabled")
         self.apply_btn.pack(side="left")
         ttk.Checkbutton(ab, text="Dry run", variable=self.dry_run).pack(side="left", padx=8)
         ttk.Button(ab, text="Show plan in log", command=self.show_plan).pack(side="left")
-        ttk.Button(ab, text="Export CSV...", command=self.export).pack(side="right")
+        ttk.Button(ab, text="Export CSV...", command=self.export).pack(side="left", padx=(16, 0))
+
+        # Re-pack so the controls under the table are laid out first, bottom-up, and the table takes
+        # whatever height is left. Otherwise a short window pushes Apply off the bottom.
+        bottom = [ab, self.tip_lbl, eb, self.tags_lbl]          # bottom-most first
+        infos = [{k: v for k, v in w.pack_info().items() if k in ("fill", "padx", "pady", "anchor")} for w in bottom]
+        for w in bottom + [tf]:
+            w.pack_forget()
+        for w, info in zip(bottom, infos):
+            w.pack(side="bottom", **info)
+        tf.pack(fill="both", expand=True, pady=4)
 
         # --- log
         lf = ttk.LabelFrame(vpaned, text=" Log (drag the divider above to make it bigger) ", padding=4)
         vpaned.add(lf, weight=0)
-        self.log_txt = tk.Text(lf, height=12, wrap="none", font=MONO, state="disabled")
+        self.log_txt = tk.Text(lf, height=8, wrap="none", font=MONO, state="disabled")
         lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log_txt.yview)
         lxs = ttk.Scrollbar(lf, orient="horizontal", command=self.log_txt.xview)
         self.log_txt.configure(yscrollcommand=lsb.set, xscrollcommand=lxs.set)
@@ -1040,8 +1112,8 @@ class App(tk.Tk):
         names = sorted(total)
         labels = {t: "%s   (%d non-compliant / %d)" % (t, bad[t], total[t]) for t in names}
         ttk.Label(win, text="Tick the resource types to show in the list:", padding=(8, 8, 8, 2)).pack(anchor="w")
-        bar = ttk.Frame(win, padding=(8, 0))
-        bar.pack(fill="x")
+        bar = WrapFrame(win)
+        bar.pack(fill="x", padx=8)
         cl = CheckList(win, height=min(420, 26 * len(names) + 10))
 
         def set_all(v, only_bad=False):
@@ -1094,6 +1166,8 @@ class App(tk.Tk):
                              values=vals, tags=(tag,))
         self._shown = len(rows)
         self._sync_header_box()
+        self.cluster_pick.configure(values=sorted({r["eks_cluster"] for r in self.resources
+                                                   if r.get("eks_cluster") and self._in_scope(r)}))
         off = [t for t in present if not self.type_filter.get(t, True)]
         self.types_btn.configure(text=("Types: %d of %d ▾" % (len(present) - len(off), len(present))) if off else "Types: all ▾")
         self._update_counts()
@@ -1149,6 +1223,43 @@ class App(tk.Tk):
             if iid:
                 self.toggle_checked([iid])
                 return "break"   # don't change the highlight when clicking the box
+
+    def tick_cluster(self, name):
+        """Tick every resource of one EKS cluster: the cluster, nodegroups, nodes, their volumes and
+        interfaces, launch templates, Auto Scaling groups, security groups... (pod resources stay hidden)."""
+        if not name:
+            return
+        members = [i for i, r in enumerate(self.resources) if r.get("eks_cluster") == name and self._in_scope(r)]
+        shown = set(self.tree.get_children())
+        tick = [str(i) for i in members if str(i) in shown]
+        self.toggle_checked(tick, True)
+        kinds = Counter(self._tkey(self.resources[int(i)]) for i in tick)
+        self.log("Ticked %d resources of EKS cluster %s: %s" % (
+            len(tick), name, ", ".join("%s x%d" % kv for kv in sorted(kinds.items())) or "none shown"))
+        hidden = len(members) - len(tick)
+        if hidden:
+            self.log("   %d more resources of %s are hidden by the filters (for example already compliant, or a type "
+                     "unticked in Types) and are not ticked. Untick 'Only show non-compliant' / clear the filter "
+                     "and pick the cluster again to include them." % (hidden, name))
+
+    def on_right_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        r = self.resources[int(iid)]
+        m = tk.Menu(self, tearoff=0)
+        on = int(iid) in self.checked
+        m.add_command(label="Untick this row" if on else "Tick this row",
+                      command=lambda: self.toggle_checked([iid], not on))
+        cl = r.get("eks_cluster")
+        if cl:
+            m.add_command(label="Tick everything in EKS cluster %s" % cl, command=lambda: self.tick_cluster(cl))
+        m.add_separator()
+        m.add_command(label="Untick all", command=self.uncheck_all)
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
 
     def _targets(self):
         """Rows the 'ticked' buttons act on: ticked rows that are shown, else the highlighted rows."""

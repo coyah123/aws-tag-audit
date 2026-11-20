@@ -93,6 +93,7 @@ Keep `aws_tag_audit.py` in the same folder, because the GUI uses its scan and ta
    - **Set on ticked** sets it on the ticked rows that are shown. If nothing is ticked, it uses the highlighted rows instead.
    - **Set on all shown** sets it on every row in the list. Use the filter first, for example `ec2:volume` or `us-gov-west-1`.
    - **Clear pending (ticked)** removes pending values from the ticked rows.
+   - **Tick a whole EKS cluster** (dropdown), or right-click any row in a cluster and choose *Tick everything in EKS cluster …*: ticks the cluster, its nodegroups, nodes, node volumes and interfaces, launch templates, Auto Scaling groups and security groups in one go. Pod resources stay out. Only shown rows are ticked, so untick **Only show non-compliant** first if you also want to overwrite resources that already have the tag.
    - **Double-click a tag cell** to edit a single resource.
    - With "only where missing" ticked, resources that already have a value for that key are left alone.
 7. **Apply.** First the full plan is written to the log: each resource with its change (`Program: (missing) -> ALPHA`), then the exact AWS CLI commands equivalent to the API calls the tool will make, for example `aws resourcegroupstaggingapi tag-resources --region us-east-1 --resource-arn-list arn:… --tags Program=ALPHA` and `aws iam tag-role --role-name app-role --tags Key=Program,Value=ALPHA`. Then a confirmation dialog asks before anything changes. **Show plan in log** prints the plan without applying. If the Tagging API rejects a resource during apply, the log shows the service-specific command used instead. Tick **Dry run** to simulate without changing anything. Failed changes stay pending, with the error shown in the log. Each apply writes a `tag-apply-results_<acct>_<time>.csv` file to the current folder.
@@ -282,7 +283,7 @@ Run `scan` again. Anything you tagged will be gone from the untagged list.
 
 The tool covers an EKS cluster's **AWS infrastructure**, and skips the things that exist only because of what runs **inside** the cluster.
 
-**Listed** (main types, ticked by default). Each one gets an **EKS cluster** column, so you can see what belongs to which cluster, and typing the cluster name in the filter box shows just that cluster.
+**Listed** (main types, ticked by default). Each one gets an **EKS cluster** column, so you can see what belongs to which cluster, and typing the cluster name in the filter box shows just that cluster. Volumes and network interfaces attached to a node count as part of that node's cluster even when they have no cluster tags of their own. To tag everything in a cluster at once, use **Tick a whole EKS cluster** in the GUI, then **Set on ticked**.
 
 | Resource | Type |
 |---|---|
