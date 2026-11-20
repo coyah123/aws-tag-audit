@@ -279,12 +279,42 @@ K8S_ENI_TAGS = ("node.k8s.amazonaws.com/", "vpcresources.k8s.aws/", "cluster.k8s
 EKS_POD_TYPES = {"podidentityassociation"}
 
 
+# Tags EKS / eksctl / Karpenter put on everything they create FOR a cluster (nodes, node volumes,
+# nodegroup ASGs, launch templates, cluster security group, eksctl-made VPCs...).
+EKS_CLUSTER_KEYS = ("eks:cluster-name", "aws:eks:cluster-name", "alpha.eksctl.io/cluster-name",
+                    "eksctl.cluster.k8s.io/v1alpha1/cluster-name")
+EKS_NODEGROUP_KEYS = ("eks:nodegroup-name", "alpha.eksctl.io/nodegroup-name")
+# Karpenter stamps these on nodes it launches. NOT karpenter.sh/discovery: that's a tag YOU put on
+# subnets/SGs so Karpenter can find them - it doesn't mean Karpenter owns them.
+EKS_OWNER_PREFIXES = ("karpenter.sh/", "karpenter.k8s.aws/")
+
+
+def _eks_owner(tags):
+    """Cluster name if these tags say the resource is created/owned by an EKS cluster, else None."""
+    for k in EKS_CLUSTER_KEYS:
+        if tags.get(k):
+            return tags[k]
+    # kubernetes.io/cluster/<name> = owned  (value "shared" = shared VPC/subnet, not owned -> keep)
+    owned = [k.split("/", 2)[2] for k, v in tags.items() if k.startswith("kubernetes.io/cluster/") and v == "owned"]
+    if owned:
+        return owned[0]
+    if any(tags.get(k) for k in EKS_NODEGROUP_KEYS) or any(
+            k.startswith(EKS_OWNER_PREFIXES) and k != "karpenter.sh/discovery" for k in tags):
+        return "(unnamed)"
+    return None
+
+
 def k8s_workload_reason(r):
-    """Return why a resource is a Kubernetes *workload* artifact (not cluster infrastructure), else None.
-    EKS clusters, nodegroups, node instances, their launch templates/ASGs and the cluster SG are NOT flagged."""
+    """Why a resource is managed by EKS/Kubernetes rather than by you, else None.
+    Only the EKS cluster itself is never flagged: tag the cluster (and nodegroups) and EKS
+    propagates; tagging nodes, pod volumes or controller-made load balancers one by one is noise."""
     tags = r.get("tags") or {}
-    if r["service"] == "eks" and r["type"] in EKS_POD_TYPES:
-        return "EKS pod identity association"
+    if r["service"] == "eks":
+        if r["type"] in EKS_POD_TYPES:
+            return "EKS pod identity association"
+        return None
+    if r["service"] == "autoscaling" and tags.get("eks:nodegroup-name"):
+        return "part of EKS cluster %s (nodegroup Auto Scaling group)" % (tags.get("eks:cluster-name") or "?")
     if r["service"] == "ec2" and r["type"] == "network-interface":
         desc = (r.get("name") or "").lower()
         if desc.startswith(("aws-k8s-", "aws-k8s-branch")) or tags.get("eks:eni:owner") == "eks-vpc-resource-controller":
@@ -296,7 +326,33 @@ def k8s_workload_reason(r):
             return "Kubernetes Service/Ingress load balancer"
         if k.startswith(K8S_ENI_TAGS):
             return "pod network interface (VPC CNI)"
+    owner = _eks_owner(tags)
+    if owner:
+        what = {"instance": "node", "volume": "node volume", "launch-template": "node launch template",
+                "security-group": "security group", "network-interface": "node network interface"}.get(r["type"], r["type"])
+        return "part of EKS cluster %s (%s)" % (owner, what)
     return None
+
+
+# Fine-grained types: unticked by default (GUI) / skipped unless --all-types (CLI). These are either
+# very numerous (snapshots, AMIs, ENIs, log groups, IAM), sub-parts of something bigger (subnets,
+# route tables, target groups, nodegroups), or rarely the unit anyone tags for cost/ownership.
+DETAIL_TYPES = {
+    "ec2:snapshot", "ec2:image", "ec2:subnet", "ec2:network-interface", "ec2:internet-gateway", "ec2:route-table",
+    "ec2:network-acl", "ec2:dhcp-options", "ec2:key-pair", "ec2:launch-template", "ec2:vpc-endpoint",
+    "ec2:security-group", "elbv2:targetgroup", "rds:snapshot", "logs", "cloudformation",
+    "iam:role", "iam:user", "iam:policy", "route53", "eks:nodegroup", "eks:fargateprofile", "eks:addon",
+    "tagging-api",
+}
+
+
+def is_main_type(name):
+    return name not in DETAIL_TYPES
+
+
+def default_include():
+    """Collector names scanned when the user doesn't choose: main built-ins + all custom types."""
+    return {n for n, g, _, _ in COLLECTORS if is_main_type(n)}
 
 
 @collector("ecr")
@@ -347,15 +403,25 @@ def efs(ctx, region):
         yield res("elasticfilesystem", "file-system", region, fs["FileSystemId"], arn, tag_list_to_dict(fs.get("Tags")), name=fs.get("Name"))
 
 
-@collector("rds")
-def rds(ctx, region):
+@collector("rds:db", "rds")
+def rds_db(ctx, region):
     c = ctx.client("rds", region)
     for db in paginate(c, "describe_db_instances", "DBInstances"):
         i = db["DBInstanceIdentifier"]
         yield res("rds", "db", region, i, db["DBInstanceArn"], tag_list_to_dict(db.get("TagList")), name=i)
+
+
+@collector("rds:cluster", "rds")
+def rds_cluster(ctx, region):
+    c = ctx.client("rds", region)
     for cl in paginate(c, "describe_db_clusters", "DBClusters"):
         i = cl["DBClusterIdentifier"]
         yield res("rds", "cluster", region, i, cl["DBClusterArn"], tag_list_to_dict(cl.get("TagList")), name=i)
+
+
+@collector("rds:snapshot", "rds")
+def rds_snapshot(ctx, region):
+    c = ctx.client("rds", region)
     for s in paginate(c, "describe_db_snapshots", "DBSnapshots", SnapshotType="manual"):
         i = s["DBSnapshotIdentifier"]
         yield res("rds", "snapshot", region, i, s["DBSnapshotArn"], tag_list_to_dict(s.get("TagList")), name=i)
@@ -402,14 +468,23 @@ def sfn(ctx, region):
 
 
 # ---- Networking -------------------------------------------------------------
-@collector("elbv2")
-def elbv2(ctx, region):
+@collector("elbv2:loadbalancer", "elbv2")
+def elbv2_lbs(ctx, region):
     c = ctx.client("elbv2", region)
-    items = []
-    for lb in paginate(c, "describe_load_balancers", "LoadBalancers"):
-        items.append(("loadbalancer", lb["LoadBalancerArn"], lb["LoadBalancerName"]))
-    for tg in paginate(c, "describe_target_groups", "TargetGroups"):
-        items.append(("targetgroup", tg["TargetGroupArn"], tg["TargetGroupName"]))
+    items = [("loadbalancer", lb["LoadBalancerArn"], lb["LoadBalancerName"])
+             for lb in paginate(c, "describe_load_balancers", "LoadBalancers")]
+    return _elbv2_tagged(c, region, items)
+
+
+@collector("elbv2:targetgroup", "elbv2")
+def elbv2_tgs(ctx, region):
+    c = ctx.client("elbv2", region)
+    items = [("targetgroup", tg["TargetGroupArn"], tg["TargetGroupName"])
+             for tg in paginate(c, "describe_target_groups", "TargetGroups")]
+    return _elbv2_tagged(c, region, items)
+
+
+def _elbv2_tagged(c, region, items):
     for chunk in chunks(items, 20):
         td = c.describe_tags(ResourceArns=[a for _, a, _ in chunk]).get("TagDescriptions", [])
         tagmap = {d["ResourceArn"]: tag_list_to_dict(d.get("Tags")) for d in td}
@@ -1009,13 +1084,19 @@ def write_csv(path, rows, fields):
 def cmd_scan(args):
     ctx = Ctx(args.profile, args.region, args.workers)
     regions = args.regions or ctx.enabled_regions()
-    include = set(args.services or [])
+    if args.services:
+        include, scope = set(args.services), "only " + " ".join(args.services)
+    elif args.all_types:
+        include, scope = set(), "all resource types"
+    else:
+        include, scope = default_include(), "main resource types (add --all-types for fine-grained ones)"
     exclude = set(args.exclude_services or [])
     print("Account %s  partition %s  caller %s" % (ctx.account, ctx.partition, ctx.caller_arn), file=sys.stderr)
     print("Regions: %s" % ", ".join(regions), file=sys.stderr)
+    print("Scanning: %s%s" % (scope, "; plus Tagging API catch-all" if args.tagging_api else ""), file=sys.stderr)
 
     t0 = time.time()
-    resources = run_scan(ctx, regions, include, exclude, not args.no_tagging_api)
+    resources = run_scan(ctx, regions, include, exclude, args.tagging_api)
     keys = args.key or ["Program"]
 
     untagged, k8s_skipped = [], Counter()
@@ -1072,7 +1153,7 @@ def cmd_scan(args):
         for t, n in by_region.most_common():
             print("  %6d  %s" % (n, t))
     if k8s_skipped:
-        print("\nLeft out %d Kubernetes workload resources (not cluster infrastructure); add --include-k8s-workloads to list them:"
+        print("\nLeft out %d resources managed by EKS/Kubernetes (tag the cluster instead; add --include-eks-managed to list them):"
               % sum(k8s_skipped.values()))
         for why, n in k8s_skipped.most_common():
             print("  %6d  %s" % (n, why))
@@ -1429,11 +1510,12 @@ def cmd_types(args):
         for r in rows[:25]:
             print("  %-30s %-30s %s  %s" % (r["id"][:30], r["name"][:30], r["arn"], json.dumps(r["tags"])[:80]))
         return
-    print("Built-in types (use with --services; a service name selects all its types):")
+    print("Built-in types (use with --services; a service name selects all its types).")
+    print("* = fine-grained: skipped by default, scanned with --all-types or by naming it in --services")
     groups = defaultdict(list)
     for name, group, scope, _ in COLLECTORS:
         if group != CUSTOM_GROUP:
-            groups[group].append(name + (" (global)" if scope == "global" else ""))
+            groups[group].append(name + ("*" if not is_main_type(name) else "") + (" (global)" if scope == "global" else ""))
     for g in sorted(groups):
         print("  %-16s %s" % (g, ", ".join(groups[g])))
     customs = load_custom_types(args.types_file)
@@ -1474,11 +1556,17 @@ def main(argv=None):
 
     s = sub.add_parser("scan", parents=[common], help="Inventory resources and list those missing the tag")
     s.add_argument("--exclude-services", nargs="+", help="Skip these collectors, e.g. logs ec2:network-interface")
-    s.add_argument("--no-tagging-api", action="store_true", help="Don't use the Resource Groups Tagging API catch-all")
+    s.add_argument("--all-types", action="store_true",
+                   help="Scan fine-grained types too (snapshots, AMIs, subnets, ENIs, route tables, security groups, "
+                        "log groups, IAM, EKS nodegroups/add-ons...). Default: main resource types only")
+    s.add_argument("--tagging-api", action="store_true",
+                   help="Also use the Resource Groups Tagging API catch-all (every already-tagged resource of ANY type; "
+                        "very granular). Off by default")
+    s.add_argument("--no-tagging-api", action="store_true", help=argparse.SUPPRESS)  # old flag; now the default
     s.add_argument("--out", default="tag-audit-output", help="Output directory (default ./tag-audit-output)")
-    s.add_argument("--include-k8s-workloads", action="store_true",
-                   help="Also list AWS resources Kubernetes creates for workloads (PVC volumes, pod ENIs, "
-                        "Service/Ingress load balancers). Default: only cluster infrastructure is listed")
+    s.add_argument("--include-eks-managed", "--include-k8s-workloads", dest="include_k8s_workloads", action="store_true",
+                   help="Also list resources EKS/Kubernetes create for a cluster (nodes, node volumes, nodegroup ASGs, "
+                        "PVC volumes, pod ENIs, Service/Ingress load balancers). Default: only the cluster itself")
     s.set_defaults(func=cmd_scan)
 
     a = sub.add_parser("apply", parents=[common], help="Add the tag using values from the CSV / prompts")

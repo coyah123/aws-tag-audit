@@ -183,9 +183,10 @@ class TypeTree(ttk.Frame):
             for name, scope in sorted(items):
                 iid = "L:" + name
                 short = name.split(":", 1)[1] if (":" in name and g != core.CUSTOM_GROUP and parent) else name
-                self.base[iid] = short + ("  (global)" if scope == "global" else "")
+                fine = not core.is_main_type(name)
+                self.base[iid] = short + ("  (global)" if scope == "global" else "") + ("  · fine-grained" if fine else "")
                 self.names[iid] = name
-                self.state[name] = old.get(name, True)
+                self.state[name] = old.get(name, not fine)
                 self.tv.insert(parent, "end", iid=iid)
         self._render()
 
@@ -228,6 +229,11 @@ class TypeTree(ttk.Frame):
     def set_all(self, v):
         for n in self.state:
             self.state[n] = v
+        self._render()
+
+    def main_only(self):
+        for n in self.state:
+            self.state[n] = core.is_main_type(n)
         self._render()
 
     def focused_name(self):
@@ -534,16 +540,18 @@ class App(tk.Tk):
         sf.pack(fill="both", expand=True)
         bar = ttk.Frame(sf)
         bar.pack(fill="x")
-        ttk.Button(bar, text="All", width=5, command=lambda: self.types.set_all(True)).pack(side="left")
-        ttk.Button(bar, text="None", width=5, command=lambda: self.types.set_all(False)).pack(side="left", padx=(2, 8))
+        ttk.Button(bar, text="Main only", command=lambda: self.types.main_only()).pack(side="left")
+        ttk.Button(bar, text="All", width=4, command=lambda: self.types.set_all(True)).pack(side="left", padx=2)
+        ttk.Button(bar, text="None", width=5, command=lambda: self.types.set_all(False)).pack(side="left", padx=(0, 8))
         ttk.Button(bar, text="New type\u2026", command=self.new_custom).pack(side="left")
         ttk.Button(bar, text="Edit\u2026", width=6, command=self.edit_custom).pack(side="left", padx=2)
         ttk.Button(bar, text="Delete", width=6, command=self.delete_custom).pack(side="left")
         self.types = TypeTree(sf, height=8)
         self.types.pack(fill="both", expand=True, pady=4)
         self.types.tv.bind("<Double-1>", lambda e: self.edit_custom(quiet=True))
-        self.use_api = tk.BooleanVar(value=True)
-        ttk.Checkbutton(sf, text="Also use Tagging API catch-all (any already-tagged type)", variable=self.use_api).pack(anchor="w")
+        self.use_api = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sf, text="Also use Tagging API catch-all (every tagged thing of ANY type, very granular)",
+                        variable=self.use_api).pack(anchor="w")
         self.custom_types = []
         try:
             self.custom_types = core.load_custom_types()
@@ -567,7 +575,7 @@ class App(tk.Tk):
         self.only_bad = tk.BooleanVar(value=True)
         ttk.Checkbutton(fb, text="Only show non-compliant", variable=self.only_bad, command=self.refresh).pack(side="left", padx=8)
         self.hide_k8s = tk.BooleanVar(value=True)
-        ttk.Checkbutton(fb, text="Hide Kubernetes workloads", variable=self.hide_k8s,
+        ttk.Checkbutton(fb, text="Hide EKS-managed (nodes, pods' volumes/ENIs/LBs)", variable=self.hide_k8s,
                         command=self.refresh).pack(side="left", padx=(0, 8))
         self.type_filter = {}  # "service:type" -> shown?
         self.types_btn = ttk.Button(fb, text="Types: all ▾", command=self.open_type_filter)
@@ -881,7 +889,7 @@ class App(tk.Tk):
             self.log("Scan complete: %d resources, %d non-compliant for %s." % (len(resources), bad, ", ".join(self.keys())))
             k8s = Counter(r["k8s"] for r in resources if r.get("k8s"))
             if k8s:
-                self.log("Kubernetes workload resources (hidden while 'Hide Kubernetes workloads' is ticked): " +
+                self.log("Hidden as EKS/Kubernetes-managed (untick 'Hide EKS-managed' to see them): " +
                          ", ".join("%s x%d" % kv for kv in k8s.most_common()))
             # Suggest keys people choose; skip ones AWS/Kubernetes controllers stamp automatically.
             system = ("aws:", "eks:", "karpenter.", "kubernetes.io", "k8s.", "CSIVolume")
@@ -1068,7 +1076,7 @@ class App(tk.Tk):
         k8s = getattr(self, "_k8s_hidden", 0)
         self.count_lbl.configure(text="%d shown  |  %d selected  |  %d of %d non-compliant  |  %d pending%s" % (
             getattr(self, "_shown", 0), len(self.tree.selection()), bad, len(scope), len(p),
-            ("  |  %d k8s workloads hidden" % k8s) if k8s else ""))
+            ("  |  %d EKS-managed hidden" % k8s) if k8s else ""))
         n_res = len({i for i, _ in p})
         self.apply_btn.configure(text="Apply %d pending changes (%d resources)" % (len(p), n_res),
                                  state="normal" if p and not self.busy else "disabled")

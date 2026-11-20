@@ -75,15 +75,18 @@ Keep `aws_tag_audit.py` in the same folder, because the GUI uses its scan and ta
    - Keys stamped automatically by AWS or Kubernetes (`aws:`, `eks:`, `kubernetes.io/…`) are not suggested.
    - You can add or remove keys **after** a scan and the table updates instantly, because the scan keeps every resource's full tag set.
 4. **Resource types.** A checklist of every resource type, grouped by service.
+   - **By default only main resource types are ticked:** instances, volumes, VPCs, NAT gateways, buckets, databases, Lambda, load balancers, EKS clusters, ECS/ECR, queues, topics, secrets, KMS keys and so on.
+   - **Fine-grained types** are marked `· fine-grained` and start unticked: AMIs, snapshots, subnets, ENIs, route tables, NACLs, security groups, target groups, log groups, IAM, CloudFormation, EKS nodegroups/add-ons/Fargate profiles. Tick them when you need them.
+   - **Main only** resets to the default.
    - Click a service to toggle all of its types, or expand it to pick individual types (for example only `ec2 › volume`).
    - Your own custom types appear under **★ custom**. See [Custom resource types](#custom-resource-types) below.
-   - The "Tagging API catch-all" option also picks up any *already-tagged* resource of any other type. After a scan, the log lists the types that only the Tagging API found. Those are good candidates for a custom type, because any never-tagged ones are invisible to the Tagging API.
+   - The "Tagging API catch-all" option (**off by default**, because it is very granular) also picks up every *already-tagged* resource of any other type. After a scan, the log lists the types that only the Tagging API found.
 5. **Scan.** The table shows one column per required key:
    - the existing value, or `✗ missing`, `✗ (empty)` or `✗ program=x` (wrong case)
    - red rows are non-compliant, green rows are compliant, yellow rows have a pending change
    - The filter box and the "Only show non-compliant" toggle narrow the list, and you can click a column header to sort.
    - **Types ▾** opens a checklist of every resource type in the results, with "non-compliant / total" counts. Untick types to hide them from the list, and the button shows "Types: 4 of 12". **Only types with gaps** ticks just the types that still need tags.
-   - **Hide Kubernetes workloads** is on by default. See [EKS and Kubernetes](#eks-and-kubernetes).
+   - **Hide EKS-managed** is on by default. See [EKS and Kubernetes](#eks-and-kubernetes).
    - "Set on all shown" and Export only affect the rows currently shown, so filter first and then tag.
 6. **Set values.** Choose a key and type a value. Then:
    - **Set on selected** (Ctrl+A, or ⌘A on a Mac, selects all shown rows), or **Set on all shown**. Use the filter first, for example `ec2:volume` or `us-gov-west-1`.
@@ -175,7 +178,11 @@ python aws_tag_audit.py scan                                  # all enabled regi
 python aws_tag_audit.py scan --profile work --region us-gov-west-1
 python aws_tag_audit.py scan --regions us-east-1 us-west-2 --services ec2 s3 rds
 python aws_tag_audit.py scan --key Program Owner CostCenter   # require several keys
+python aws_tag_audit.py scan --all-types                       # include fine-grained types too
+python aws_tag_audit.py scan --services ec2:snapshot           # just one (any) type
 ```
+
+**By default `scan` covers main resource types only**, the same set the GUI ticks by default: instances, volumes, VPCs, buckets, databases, Lambda, load balancers, EKS clusters and so on. `--all-types` adds the fine-grained ones (AMIs, snapshots, subnets, ENIs, route tables, security groups, target groups, log groups, IAM, EKS nodegroups/add-ons). `types` lists which is which, with fine-grained types marked `*`.
 
 `--key` defaults to `Program`. With several keys, a resource is listed if it is missing **any** of them, and the summary shows a count for each key per resource type.
 
@@ -206,7 +213,7 @@ Two sources, merged by ARN:
    - ALB/NLB, target groups, classic ELB, Route 53 zones
    - KMS (customer-managed keys), Secrets Manager, CloudWatch log groups, CloudFormation stacks
    - IAM roles, users, and customer-managed policies
-2. **The Resource Groups Tagging API** (`tag:GetResources`). This covers almost every service, but it **only returns resources that have, or once had, at least one tag**. Use it as a catch-all for services that aren't enumerated directly. Turn it off with `--no-tagging-api`.
+2. **The Resource Groups Tagging API** (`tag:GetResources`). This covers almost every service, but it **only returns resources that have, or once had, at least one tag**. It's a catch-all for services that aren't enumerated directly, and it's **off by default** because it pulls in every tagged thing at the finest grain. Turn it on with `--tagging-api`, or the checkbox in the GUI.
 
 Rows found only through the Tagging API have `source=tagging-api`.
 
@@ -270,28 +277,28 @@ Run `scan` again. Anything you tagged will be gone from the untagged list.
 
 ## EKS and Kubernetes
 
-For EKS, the tool lists the **cluster and its infrastructure**:
+For EKS, the tool lists **only the cluster** by default (`eks:cluster`). Tag the cluster; there's no need to tag everything inside it.
 
-| Listed | Type |
+- **Fine-grained, off by default:** `eks:nodegroup`, `eks:fargateprofile` and `eks:addon`. Tick them, or use `--all-types`, if you also want to tag those.
+- **Hidden as EKS-managed:** anything EKS or Kubernetes creates *for* a cluster. It's owned by the cluster, comes and goes with it, and picks up tags from the cluster, nodegroup and launch template. These resources are recognised by the ownership tags EKS, eksctl, Karpenter and the Kubernetes controllers stamp on them:
+
+| Hidden | How it's recognised |
 |---|---|
-| Clusters | `eks:cluster` |
-| Managed nodegroups | `eks:nodegroup` |
-| Fargate profiles | `eks:fargateprofile` |
-| Add-ons | `eks:addon` |
-| Nodes | `ec2:instance` (named and tagged by the nodegroup) |
-| Node launch templates, Auto Scaling groups, cluster security group | their normal EC2 / Auto Scaling types |
-
-Things Kubernetes creates **for workloads** are *not* listed by default, because they come and go with pods and are owned by the cluster rather than by you. They are recognised by the tags and descriptions that EKS and its controllers put on them:
-
-| Left out | How it's recognised |
-|---|---|
+| Nodes, node volumes and node ENIs, nodegroup launch templates, nodegroup Auto Scaling groups, the cluster security group, VPCs/subnets eksctl created | `eks:cluster-name`, `eks:nodegroup-name`, `aws:eks:cluster-name`, `alpha.eksctl.io/cluster-name`, `kubernetes.io/cluster/<name>=owned`, `karpenter.sh/…` tags |
 | PersistentVolume EBS/EFS/FSx volumes | `kubernetes.io/created-for/…`, `CSIVolumeName`, `ebs.csi.aws.com/…` tags |
 | Pod network interfaces (VPC CNI, security groups for pods) | `aws-K8S-…` / `aws-k8s-branch-eni` description, `node.k8s.amazonaws.com/…` tags |
 | Load balancers, target groups and security groups made for Services/Ingresses | `elbv2.k8s.aws/…`, `ingress.k8s.aws/…`, `service.k8s.aws/…`, `kubernetes.io/service-name` tags |
 | EKS pod identity associations | resource type |
 
-- **GUI:** untick **Hide Kubernetes workloads** to see them. The counts line shows how many are hidden, and the log lists them by kind.
-- **CLI:** they're left out of `*_untagged.csv`. The summary prints how many were left out, and `--include-k8s-workloads` lists them. The inventory CSV always includes them, with a `k8s_workload` column.
+Some things are **not** hidden:
+- the EKS cluster itself
+- subnets in a shared VPC (`kubernetes.io/cluster/<name>=shared`)
+- subnets and security groups you tagged `karpenter.sh/discovery` so Karpenter can find them
+- ordinary instances in non-EKS Auto Scaling groups
+
+To see the hidden resources:
+- **GUI:** untick **Hide EKS-managed**. The counts line shows how many are hidden, and the log lists them by kind and cluster.
+- **CLI:** they're left out of `*_untagged.csv`, and the summary says how many. `--include-eks-managed` lists them. The inventory CSV always includes them, with a `k8s_workload` column that gives the reason.
 
 Tagging EKS resources uses the Tagging API first, then the EKS `TagResource` API as a fallback.
 
@@ -336,7 +343,7 @@ Services that aren't available in a region are silently skipped (`ServiceNotInRe
 ```
 common:  --profile  --region  --key K1 [K2 ...]  --regions r1 r2  --services ec2 s3 ec2:volume eks  --workers 8  --types-file F
 types:   --test NAME
-scan:    --exclude-services logs ec2:network-interface   --no-tagging-api   --include-k8s-workloads   --out DIR
+scan:    --all-types   --tagging-api   --include-eks-managed   --exclude-services logs ec2:volume   --out DIR
 apply:   --csv FILE  -i/--interactive  --value [KEY=]V (repeatable)  --overwrite-csv-values  --dry-run  -y/--yes
 ```
 
