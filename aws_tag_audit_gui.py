@@ -1149,7 +1149,8 @@ class App(tk.Tk):
                 continue
             bad = self._noncompliant(r)
             has_pending = any((i, k) in self.pending for k in keys)
-            if self.only_bad.get() and not bad and not has_pending:
+            # ticked rows stay visible even when compliant (e.g. a whole EKS cluster was ticked)
+            if self.only_bad.get() and not bad and not has_pending and i not in self.checked:
                 continue
             vals = ["%s:%s" % (r["service"], r["type"]), r["region"], r["name"], r["id"], r.get("eks_cluster", "")] + \
                    [self._cell(i, k) for k in keys] + [tags_text(r["tags"])]
@@ -1230,17 +1231,24 @@ class App(tk.Tk):
         if not name:
             return
         members = [i for i, r in enumerate(self.resources) if r.get("eks_cluster") == name and self._in_scope(r)]
+        # Ignores "Only show non-compliant": ticked rows are always shown, so compliant ones appear too.
+        self.checked.update(members)
+        self.refresh()
         shown = set(self.tree.get_children())
         tick = [str(i) for i in members if str(i) in shown]
-        self.toggle_checked(tick, True)
+        self.checked.difference_update(i for i in members if str(i) not in shown)  # hidden by text/Types filter
+        self._sync_header_box()
+        self._update_counts()
         kinds = Counter(self._tkey(self.resources[int(i)]) for i in tick)
         self.log("Ticked %d resources of EKS cluster %s: %s" % (
-            len(tick), name, ", ".join("%s x%d" % kv for kv in sorted(kinds.items())) or "none shown"))
+            len(tick), name, ", ".join("%s x%d" % kv for kv in sorted(kinds.items())) or "none"))
         hidden = len(members) - len(tick)
         if hidden:
-            self.log("   %d more resources of %s are hidden by the filters (for example already compliant, or a type "
-                     "unticked in Types) and are not ticked. Untick 'Only show non-compliant' / clear the filter "
-                     "and pick the cluster again to include them." % (hidden, name))
+            self.log("   %d more resources of %s are hidden by the filter box or the Types filter and are not "
+                     "ticked. Clear those and pick the cluster again to include them." % (hidden, name))
+        if any(not self._noncompliant(self.resources[int(i)]) for i in tick) and self.only_missing.get():
+            self.log("   Some of these already have every required tag. Untick 'only where missing' if you want "
+                     "Set on ticked to overwrite their values.")
 
     def on_right_click(self, event):
         iid = self.tree.identify_row(event.y)
